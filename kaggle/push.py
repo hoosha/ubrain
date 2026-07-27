@@ -8,11 +8,15 @@ whichever Kaggle account is authenticated.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Prefer the CLI installed alongside this interpreter (e.g. inside a venv) over PATH.
+KAGGLE = (shutil.which('kaggle', path=os.path.dirname(sys.executable))
+          or shutil.which('kaggle') or 'kaggle')
 
 KERNELS = {
     'prep': dict(code='prep.py', gpu=False, sources=[]),
@@ -28,7 +32,7 @@ def username():
     if os.path.exists(legacy):
         with open(legacy) as f:
             return json.load(f)['username']
-    out = subprocess.run(['kaggle', 'config', 'view'], capture_output=True, text=True).stdout
+    out = subprocess.run([KAGGLE, 'config', 'view'], capture_output=True, text=True).stdout
     for line in out.splitlines():
         if 'username' in line.lower():
             return line.split(':')[-1].strip()
@@ -60,7 +64,7 @@ def main(which):
         with open(os.path.join(tmp, 'kernel-metadata.json'), 'w') as f:
             json.dump(meta, f, indent=2)
         print(json.dumps(meta, indent=2))
-        subprocess.run(['kaggle', 'kernels', 'push', '-p', tmp], check=True)
+        subprocess.run([KAGGLE, 'kernels', 'push', '-p', tmp], check=True)
 
 
 if __name__ == '__main__':
