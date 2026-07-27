@@ -21,18 +21,19 @@ KERNELS = {
 
 
 def username():
-    for var in ('KAGGLE_USERNAME',):
-        if os.environ.get(var):
-            return os.environ[var]
-    path = os.path.expanduser('~/.kaggle/kaggle.json')
-    if os.path.exists(path):
-        with open(path) as f:
+    """Resolve the Kaggle username across the OAuth, token-file and env auth paths."""
+    if os.environ.get('KAGGLE_USERNAME'):
+        return os.environ['KAGGLE_USERNAME']
+    legacy = os.path.expanduser('~/.kaggle/kaggle.json')  # retired, still honoured if present
+    if os.path.exists(legacy):
+        with open(legacy) as f:
             return json.load(f)['username']
     out = subprocess.run(['kaggle', 'config', 'view'], capture_output=True, text=True).stdout
     for line in out.splitlines():
-        if 'username' in line:
+        if 'username' in line.lower():
             return line.split(':')[-1].strip()
-    raise SystemExit('could not determine Kaggle username; set KAGGLE_USERNAME')
+    raise SystemExit(
+        'could not determine Kaggle username. Run `kaggle auth login`, or set KAGGLE_USERNAME.')
 
 
 def main(which):
