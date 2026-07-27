@@ -27,8 +27,11 @@ wandb_run_name = 'finewebedu'
 
 dataset = 'finewebedu'
 unique_out_dir = True # prevent seed/variant checkpoints from overwriting each other
-gradient_accumulation_steps = 8 # divisible by common 1/2/4/8-GPU world sizes
-batch_size = 15
+# Sized for a 16GB GPU (measured 8.35GB peak on a Colab T4). Throughput is flat
+# across micro-batch sizes here, so keep the product batch_size*accum = 120 fixed
+# when retuning per GPU; that preserves 122,880 tokens per optimizer step.
+gradient_accumulation_steps = 15
+batch_size = 8
 block_size = 1024
 # -> 122,880 tokens per iter
 
