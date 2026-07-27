@@ -45,6 +45,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # retained for upstream config compatibility
 wandb_group = '' # optional comparison group
+wandb_artifact_every_evals = 0 # upload ckpt.pt as a W&B artifact every N evals (0 = only at the end)
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -348,6 +349,21 @@ if wandb_log and master_process:
                group=wandb_group or None,
                tags=['controlled-comparison', dataset, run_cfg.arch])
 
+eval_count = 0
+
+def upload_checkpoint(reason):
+    """Persist ckpt.pt to W&B so a run survives an ephemeral runtime being reclaimed."""
+    if not (wandb_log and master_process):
+        return
+    path = os.path.join(out_dir, 'ckpt.pt')
+    if not os.path.exists(path):
+        return
+    artifact = wandb.Artifact(f'ckpt-{run_name}', type='model',
+                              metadata={'iter': iter_num, 'reason': reason,
+                                        'best_val_loss': float(best_val_loss)})
+    artifact.add_file(path)
+    wandb.log_artifact(artifact)
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -406,6 +422,9 @@ while True:
             if improved or always_save_checkpoint:
                 torch.save(checkpoint, os.path.join(out_dir, 'best.pt'))
             print(f"saved latest checkpoint to {out_dir}")
+            eval_count += 1
+            if wandb_artifact_every_evals and eval_count % wandb_artifact_every_evals == 0:
+                upload_checkpoint('periodic')
     if (iter_num == 0 and eval_only) or iter_num >= max_iters:
         break
 
@@ -458,6 +477,7 @@ if master_process:
           f"in {time.time() - t_start:.0f}s, peak mem {peak_memory_bytes()/1e9:.2f}GB")
 
 if wandb_log and master_process:
+    upload_checkpoint('final')
     wandb.summary.update({'val/best_loss': float(best_val_loss), 'completed_iters': iter_num,
                           'tokens': iter_num * tokens_per_iter,
                           'system/peak_memory_bytes': peak_memory_bytes()})

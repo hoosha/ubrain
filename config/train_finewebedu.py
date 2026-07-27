@@ -23,6 +23,8 @@ always_save_checkpoint = False
 
 wandb_log = True
 wandb_project = 'residual-rewiring'
+# Colab runtimes are ephemeral: persist the resumable checkpoint off-VM periodically.
+wandb_artifact_every_evals = 5
 wandb_run_name = 'finewebedu'
 
 dataset = 'finewebedu'

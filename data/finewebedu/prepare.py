@@ -12,6 +12,7 @@ cut a document; no tokens are discarded or shared between splits.
 """
 import json
 import os
+import sys
 
 import numpy as np
 import tiktoken
@@ -69,3 +70,9 @@ if __name__ == '__main__':
                        tokenizer='gpt2', val_tokens=VAL_TOKENS, train_tokens=TARGET_TOKENS), f, indent=2)
     # no meta.pkl: train.py falls back to vocab_size 50304, GPT-2 BPE padded for efficiency
     print('done. train.py will use vocab_size=50304')
+    # The HF streaming reader keeps a background thread alive; interpreter finalization
+    # can abort in it (SIGABRT) long after the outputs above are written and verified,
+    # which would otherwise report a false failure. Exit now that the work is done.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
