@@ -8,6 +8,7 @@ every time a runtime is recycled.
 Requires notebook internet access to be enabled.
 """
 import os
+import shutil
 import subprocess
 import sys
 
@@ -26,6 +27,8 @@ subprocess.run(
 )
 
 for name in ('train.bin', 'val.bin', 'dataset.json'):
-    os.replace(os.path.join(CLONE, 'data/finewebedu', name), os.path.join('/kaggle/working', name))
+    # shutil.move, not os.replace: /tmp and /kaggle/working are different devices,
+    # so a rename raises EXDEV after the (slow) tokenisation has already succeeded.
+    shutil.move(os.path.join(CLONE, 'data/finewebedu', name), os.path.join('/kaggle/working', name))
 
 print('prepared:', {f: os.path.getsize(f'/kaggle/working/{f}') for f in ('train.bin', 'val.bin')})
