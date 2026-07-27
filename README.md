@@ -1,5 +1,35 @@
 
-# nanoGPT
+# ubrain
+
+Residual-connection experiments on a deliberately small, readable GPT training stack, forked from [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) at commit `3adf61e`.
+
+## Experiment controls
+
+The original model remains available with `--arch=gpt2`. The experimental baseline is `--arch=modern`, which switches to RMSNorm, RoPE, SwiGLU, QK-Norm, no linear biases, and supports `--norm_placement=pre|peri`.
+
+Cross-depth connectivity is isolated behind `--residual`:
+
+- `baseline`: the original sequential transformer stack
+- `dense`: learned zero-initialized gates from every earlier block state
+- `unet`: learned zero-initialized mirrored encoder-to-decoder skips
+- `dense_ungated`: fixed normalized dense sums for comparison
+
+Zero-initialized variants are bit-identical to their baseline at initialization. Verify the invariant with:
+
+```bash
+python test_residual.py
+```
+
+Shakespeare-char is used only for fast debugging because it overfits. Reported experiments use FineWeb-Edu with 12+ layers:
+
+```bash
+python data/finewebedu/prepare.py
+python train.py config/train_finewebedu.py --device=cuda --residual=baseline --seed=1337
+```
+
+`train.py` accepts `--device=auto|cpu|mps|cuda`, writes a unique checkpoint directory per configuration when `--unique_out_dir=True`, preserves data/RNG state across resume, and logs losses, tokens, parameter counts, estimated FLOPs, memory, and wall-clock time to W&B. Run three seeds for reported comparisons.
+
+## Upstream nanoGPT documentation
 
 ![nanoGPT](assets/nanogpt.jpg)
 
@@ -214,7 +244,7 @@ Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started
 - Eval zero-shot perplexities on standard evals (e.g. LAMBADA? HELM? etc.)
 - Finetune the finetuning script, I think the hyperparams are not great
 - Schedule for linear batch size increase during training
-- Incorporate other embeddings (rotary, alibi)
+- Incorporate other embeddings (alibi; this fork's `arch=modern` already adds RoPE)
 - Separate out the optim buffers from model params in checkpoints I think
 - Additional logging around network health (e.g. gradient clip events, magnitudes)
 - Few more investigations around better init etc.

@@ -19,6 +19,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import os
 import time
 import math
+import json
 import pickle
 from contextlib import nullcontext
 
@@ -42,7 +43,8 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2' # retained for upstream config compatibility
+wandb_group = '' # optional comparison group
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -54,6 +56,11 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# architecture / experiment knobs
+arch = 'gpt2' # 'gpt2' reproduces the published baseline; 'modern' = RMSNorm+RoPE+SwiGLU+QK-Norm
+norm_placement = 'pre' # 'pre' or 'peri'
+residual = 'baseline' # 'baseline' | 'dense' | 'unet' | 'dense_ungated'
+seed = 1337 # vary this for multi-seed runs
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -69,9 +76,10 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+device = 'auto' # auto, cpu, mps, cuda, cuda:0, ...
+dtype = 'auto' # auto, float32, bfloat16, or float16 (the latter uses a GradScaler)
 compile = True # use PyTorch 2.0 to compile the model to be faster
+unique_out_dir = False # derive a per-config/seed directory; enable for experiment sweeps
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -79,6 +87,10 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
+if device == 'auto':
+    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+if unique_out_dir:
+    out_dir = os.path.join(out_dir, f"{arch}-{norm_placement}-{residual}-L{n_layer}-s{seed}")
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
@@ -103,24 +115,37 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+device_type = torch.device(device).type
+# Resolve dtype only after the final device is known. This keeps --device=cpu
+# deterministic even on a CUDA host, and avoids unsupported MPS autocast modes.
+if dtype == 'auto':
+    dtype = ('bfloat16' if torch.cuda.is_bf16_supported() else 'float16') if device_type == 'cuda' else 'float32'
+if device_type != 'cuda' and dtype != 'float32':
+    print(f"note: {dtype} autocast is not used on {device_type}; using float32")
+    dtype = 'float32'
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = nullcontext() if dtype == 'float32' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+print(f"resolved device={device} device_type={device_type} dtype={dtype}")
 
-# poor man's data loader
+# poor man's data loader. Independent generators keep training and both evaluation
+# streams identical across architectures, regardless of model-init RNG consumption.
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
+train_rng = torch.Generator().manual_seed(seed + seed_offset)
+train_eval_rng = torch.Generator().manual_seed(seed + 10_000 + seed_offset)
+val_eval_rng = torch.Generator().manual_seed(seed + 20_000 + seed_offset)
+def get_batch(split, rng=None):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    rng = rng or train_rng
+    ix = torch.randint(len(data) - block_size, (batch_size,), generator=rng)
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
@@ -145,7 +170,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  arch=arch, norm_placement=norm_placement, residual=residual) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -156,6 +182,9 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
+    # A correct DDP resume needs one data/RNG state per rank; loading rank 0's state
+    # everywhere silently duplicates batches. Keep single-device resume exact instead.
+    assert not ddp, "DDP resume is not yet supported; restart or resume on one device"
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
@@ -165,6 +194,9 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # Backward-compatible with upstream checkpoints created before these knobs existed.
+    for k, default in [('arch', 'gpt2'), ('norm_placement', 'pre'), ('residual', 'baseline')]:
+        model_args[k] = checkpoint_model_args.get(k, default)
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -184,7 +216,7 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'arch', 'norm_placement', 'residual']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -193,13 +225,25 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.cuda.amp.GradScaler(enabled=(device_type == 'cuda' and dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
+    if 'scaler' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler'])
+    if 'rng_state' in checkpoint:
+        # torch.load(map_location=device) also moves RNG byte tensors; CPU generators
+        # only accept CPU ByteTensor state even when the model lives on MPS/CUDA.
+        torch.set_rng_state(checkpoint['rng_state'].cpu())
+        train_rng.set_state(checkpoint['train_rng_state'].cpu())
+        old_eval_state = checkpoint.get('eval_rng_state')
+        train_eval_rng.set_state(checkpoint.get('train_eval_rng_state', old_eval_state).cpu())
+        val_eval_rng.set_state(checkpoint.get('val_eval_rng_state', old_eval_state).cpu())
+        if device_type == 'cuda' and 'device_rng_state' in checkpoint:
+            torch.cuda.set_rng_state(checkpoint['device_rng_state'].cpu())
+# keep checkpoint until the prefetched next batch is restored below
 
 # compile the model
 if compile:
@@ -218,8 +262,9 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        rng = train_eval_rng if split == 'train' else val_eval_rng
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, rng)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -241,17 +286,64 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+if init_from == 'resume' and checkpoint is not None and 'next_batch' in checkpoint:
+    X, Y = (t.to(device) for t in checkpoint['next_batch'])
+else:
+    X, Y = get_batch('train') # fetch the very first batch
+checkpoint = None # free up resume state
 t0 = time.time()
+t_start = t0
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+# --- run metrics -------------------------------------------------------------
+# Log every budget axis so "did the smaller model match the baseline?" stays
+# answerable on whichever axis matters (params / FLOPs / memory / wall-clock)
+# without re-running anything. These can disagree: cross-depth skips add ~no
+# parameters but do keep early block outputs alive, which costs memory.
+run_cfg = raw_model.config # authoritative on resume; CLI globals may describe another model
+run_name = f"{run_cfg.arch}-{run_cfg.norm_placement}-{run_cfg.residual}-L{run_cfg.n_layer}-s{seed}"
+n_params = raw_model.get_num_params()
+total_params = raw_model.get_num_params(non_embedding=False)
+flops_per_token = raw_model.flops_per_token()
+
+def peak_memory_bytes():
+    if device_type == 'cuda':
+        return torch.cuda.max_memory_allocated()
+    if device_type == 'mps':
+        return torch.mps.driver_allocated_memory()
+    return 0
+
+def log_metrics(**kw):
+    if not master_process:
+        return
+    record = dict(run=run_name, arch=run_cfg.arch, norm_placement=run_cfg.norm_placement,
+                  residual=run_cfg.residual, n_layer=run_cfg.n_layer, n_embd=run_cfg.n_embd,
+                  seed=seed, dataset=dataset,
+                  device_type=device_type, dtype=dtype, params=n_params,
+                  total_params=total_params, flops_per_token=flops_per_token,
+                  peak_mem_bytes=peak_memory_bytes(),
+                  wallclock_s=time.time() - t_start, **kw)
+    with open('runs.jsonl', 'a') as f:
+        f.write(json.dumps(record, default=float) + '\n')
+
+if master_process:
+    print(f"run {run_name}: params={n_params:,} flops/token={flops_per_token:,} tokens/iter={tokens_per_iter:,}")
+if wandb_log and master_process:
+    import wandb
+    wandb_id_path = os.path.join(out_dir, 'wandb_id.txt')
+    wandb_id = open(wandb_id_path).read().strip() if os.path.exists(wandb_id_path) else wandb.util.generate_id()
+    with open(wandb_id_path, 'w') as f:
+        f.write(wandb_id)
+    wandb.init(project=wandb_project, name=run_name, id=wandb_id, resume='allow',
+               config={**config, 'device': device, 'dtype': dtype, 'out_dir': out_dir,
+                       'params': n_params, 'total_params': total_params,
+                       'flops_per_token': flops_per_token},
+               group=wandb_group or None,
+               tags=['controlled-comparison', dataset, run_cfg.arch])
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -263,28 +355,54 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        log_metrics(iter=iter_num, train_loss=losses['train'], val_loss=losses['val'],
+                    best_val_loss=min(best_val_loss, losses['val'].item()), lr=lr,
+                    tokens=iter_num * tokens_per_iter,
+                    total_flops=flops_per_token * iter_num * tokens_per_iter)
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "val/best_loss": min(best_val_loss, losses['val'].item()),
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+                "tokens": iter_num * tokens_per_iter,
+                "estimated_train_flops": flops_per_token * iter_num * tokens_per_iter,
+                "system/wallclock_s": time.time() - t_start,
+                "system/memory_bytes": peak_memory_bytes(),
+                "model/params": n_params,
+                "model/total_params": total_params,
+                "model/flops_per_token": flops_per_token,
+                "mfu": running_mfu*100, # A100-relative; use wall-clock across devices
+            }, step=iter_num)
+        improved = losses['val'] < best_val_loss
+        if improved:
             best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
+        if iter_num > 0:
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss,
+                'config': {**config, 'device': device, 'dtype': dtype, 'out_dir': out_dir},
+                'rng_state': torch.get_rng_state(),
+                'train_rng_state': train_rng.get_state(),
+                'train_eval_rng_state': train_eval_rng.get_state(),
+                'val_eval_rng_state': val_eval_rng.get_state(),
+                # X/Y is already prefetched for the next update; preserving it avoids
+                # skipping/replacing one batch after resume.
+                'next_batch': (X.cpu(), Y.cpu()),
+            }
+            if device_type == 'cuda':
+                checkpoint['device_rng_state'] = torch.cuda.get_rng_state()
+            # ckpt.pt is always the latest resumable state; best.pt is the best model.
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            if improved or always_save_checkpoint:
+                torch.save(checkpoint, os.path.join(out_dir, 'best.pt'))
+            print(f"saved latest checkpoint to {out_dir}")
+    if (iter_num == 0 and eval_only) or iter_num >= max_iters:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -328,9 +446,17 @@ while True:
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+if master_process:
+    log_metrics(iter=iter_num, final=True, best_val_loss=best_val_loss,
+                tokens=iter_num * tokens_per_iter,
+                total_flops=flops_per_token * iter_num * tokens_per_iter)
+    print(f"done {run_name}: best val loss {float(best_val_loss):.4f} "
+          f"in {time.time() - t_start:.0f}s, peak mem {peak_memory_bytes()/1e9:.2f}GB")
 
+if wandb_log and master_process:
+    wandb.summary.update({'val/best_loss': float(best_val_loss), 'completed_iters': iter_num,
+                          'tokens': iter_num * tokens_per_iter,
+                          'system/peak_memory_bytes': peak_memory_bytes()})
+    wandb.finish()
 if ddp:
     destroy_process_group()

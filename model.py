@@ -26,6 +26,30 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    """ RMSNorm. `bias` is accepted and ignored so it is drop-in for LayerNorm above. """
+
+    def __init__(self, ndim, bias=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+
+    def forward(self, input):
+        return input * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + 1e-5) * self.weight
+
+def build_rope_cache(head_dim, block_size, base=10000.0):
+    """ Precompute RoPE cos/sin tables of shape (block_size, head_dim//2). """
+    assert head_dim % 2 == 0, "RoPE needs an even head dimension"
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.outer(torch.arange(block_size).float(), inv_freq)
+    return torch.cos(freqs), torch.sin(freqs)
+
+def apply_rope(x, cos, sin):
+    """ x is (B, nh, T, hd). Half-split (GPT-NeoX) convention. """
+    T = x.size(2)
+    cos, sin = cos[:T].to(x.dtype), sin[:T].to(x.dtype)
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -42,6 +66,15 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        # modern stack: RoPE instead of learned absolute pos emb, plus QK-Norm
+        self.modern = config.arch == 'modern'
+        if self.modern:
+            head_dim = config.n_embd // config.n_head
+            self.q_norm = RMSNorm(head_dim)
+            self.k_norm = RMSNorm(head_dim)
+            cos, sin = build_rope_cache(head_dim, config.block_size)
+            self.register_buffer('rope_cos', cos, persistent=False)
+            self.register_buffer('rope_sin', sin, persistent=False)
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -57,6 +90,12 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if self.modern:
+            # QK-Norm bounds the attention logits, then RoPE injects position
+            q, k = self.q_norm(q), self.k_norm(k)
+            q = apply_rope(q, self.rope_cos, self.rope_sin)
+            k = apply_rope(k, self.rope_cos, self.rope_sin)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -91,19 +130,66 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class SwiGLUMLP(nn.Module):
+    """ SwiGLU feed-forward. Hidden dim ~8/3*n_embd (rounded up to a multiple of 128)
+    so the parameter count roughly matches the 4*n_embd GELU MLP it replaces.
+    Output projection keeps the name `c_proj` so the 1/sqrt(2L) scaled init still applies. """
+
+    def __init__(self, config):
+        super().__init__()
+        hidden = int(8 * config.n_embd / 3)
+        hidden = 128 * ((hidden + 127) // 128)
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden, bias=config.bias) # gate and up, fused
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        gate, up = self.c_fc(x).chunk(2, dim=-1)
+        return self.dropout(self.c_proj(F.silu(gate) * up))
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        norm = RMSNorm if config.arch == 'modern' else LayerNorm
+        self.ln_1 = norm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_2 = norm(config.n_embd, bias=config.bias)
+        self.mlp = SwiGLUMLP(config) if config.arch == 'modern' else MLP(config)
+        # peri-LN (arXiv 2502.02732, shipped in Gemma 2/3): normalize the sublayer
+        # output too, which bounds residual-stream growth with depth
+        self.peri = config.norm_placement == 'peri'
+        if self.peri:
+            self.ln_1_post = norm(config.n_embd, bias=config.bias)
+            self.ln_2_post = norm(config.n_embd, bias=config.bias)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        a = self.attn(self.ln_1(x))
+        x = x + (self.ln_1_post(a) if self.peri else a)
+        m = self.mlp(self.ln_2(x))
+        x = x + (self.ln_2_post(m) if self.peri else m)
         return x
+
+def skip_sources(residual, n_layer):
+    """ For each block i, which entries of the activation history it reads.
+
+    History convention in GPT.forward: outs[0] is the embedding output and outs[j]
+    is the *input* to block j (equivalently the output of block j-1). So the current
+    stream value at block i is outs[i], and valid skip sources are indices < i.
+
+    - dense / dense_ungated: block i reads every earlier stream state.
+    - unet: mirror pattern. Block i in the second half reads outs[n_layer-1-i],
+      i.e. the input of its mirrored encoder block. Reading the mirrored block's
+      *input* rather than its output matters: for i = n_layer//2 the mirrored
+      output is outs[i] itself, which would degenerate into just doubling x.
+    """
+    if residual == 'baseline':
+        return [[] for _ in range(n_layer)]
+    if residual in ('dense', 'dense_ungated'):
+        return [list(range(i)) for i in range(n_layer)]
+    if residual == 'unet':
+        return [[n_layer - 1 - i] if i >= (n_layer + 1) // 2 else [] for i in range(n_layer)]
+    raise ValueError(f"unknown residual variant: {residual}")
 
 @dataclass
 class GPTConfig:
@@ -114,6 +200,15 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    arch: str = 'gpt2' # 'gpt2': faithful to the published baseline. 'modern': RMSNorm+RoPE+SwiGLU+QK-Norm
+    norm_placement: str = 'pre' # 'pre' or 'peri'
+    residual: str = 'baseline' # 'baseline' | 'dense' | 'unet' | 'dense_ungated'
+
+    def __post_init__(self):
+        assert self.arch in ('gpt2', 'modern')
+        assert self.norm_placement in ('pre', 'peri')
+        if self.arch == 'modern':
+            self.bias = False # RMSNorm has no bias and modern LLMs drop Linear biases
 
 class GPT(nn.Module):
 
@@ -123,19 +218,49 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        norm = RMSNorm if config.arch == 'modern' else LayerNorm
+        if config.arch == 'gpt2':
+            # Preserve upstream's construction order exactly: changing it changes RNG
+            # consumption and therefore the fixed-seed baseline initialization.
+            modules = dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = norm(config.n_embd, bias=config.bias),
+            )
+        else:
+            # RoPE injects position inside attention, not into the residual stream.
+            modules = dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = norm(config.n_embd, bias=config.bias),
+            )
+        self.transformer = nn.ModuleDict(modules)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # cross-depth skip connections. Gates are zero-init so every gated variant is
+        # NUMERICALLY IDENTICAL to the baseline at step 0 -- any later difference is then
+        # attributable to learned connectivity rather than a changed init/variance.
+        # Kept as one 1-D tensor per block (not folded into the sum) so a training-time
+        # schedule can be imposed on them later; being dim()<2 they also land in the
+        # no-weight-decay group automatically, so WD does not drag them back to zero.
+        self.skip_src = skip_sources(config.residual, config.n_layer)
+        self.skip_gate = None
+        if any(self.skip_src):
+            ungated = config.residual == 'dense_ungated'
+            self.skip_gate = nn.ParameterList([
+                nn.Parameter(
+                    torch.full((len(src),), 1.0 / (len(src) + 1)) if ungated else torch.zeros(len(src)),
+                    requires_grad=bool(src) and not ungated,
+                ) for src in self.skip_src
+            ])
 
         # init all weights
         self.apply(self._init_weights)
@@ -155,8 +280,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        if non_embedding and 'wpe' in self.transformer:
+            n_params -= self.transformer.wpe.weight.numel() # absent under RoPE
         return n_params
 
     def _init_weights(self, module):
@@ -171,14 +296,25 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        if 'wpe' in self.transformer:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            tok_emb = tok_emb + self.transformer.wpe(pos) # (t, n_embd), broadcast over batch
+        x = self.transformer.drop(tok_emb)
+        if self.skip_gate is None:
+            for block in self.transformer.h:
+                x = block(x) # baseline: byte-for-byte the upstream path
+        else:
+            outs = [x] # see skip_sources() for the indexing convention
+            for i, block in enumerate(self.transformer.h):
+                src = self.skip_src[i]
+                if src:
+                    gate = self.skip_gate[i]
+                    x = x + sum(gate[k] * outs[s] for k, s in enumerate(src))
+                x = block(x)
+                outs.append(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -198,7 +334,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if 'wpe' in self.transformer:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -286,15 +423,22 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+    def flops_per_token(self):
+        """ Estimated fwd+bwd FLOPs per token. See PaLM paper Appendix B: https://arxiv.org/abs/2204.02311
+        Hardware-independent, unlike estimate_mfu below, so this is what we log for
+        cross-machine comparisons (Mac / Colab / other GPUs). """
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
+        skip_edges = sum(map(len, self.skip_src))
+        return 6*N + 12*L*H*Q*T + 6*skip_edges*cfg.n_embd
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        cfg = self.config
+        T = cfg.block_size
+        flops_per_fwdbwd = self.flops_per_token() * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second

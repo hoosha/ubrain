@@ -5,8 +5,14 @@
 __pycache__/
 *.bin
 *.pkl
+**/dataset.json
 *.pt
 *.pyc
 input.txt
 env/
 venv/
+.venv/
+/out*/
+runs.jsonl
+/wandb/
+*.log
