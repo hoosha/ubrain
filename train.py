@@ -122,7 +122,11 @@ device_type = torch.device(device).type
 # Resolve dtype only after the final device is known. This keeps --device=cpu
 # deterministic even on a CUDA host, and avoids unsupported MPS autocast modes.
 if dtype == 'auto':
-    dtype = ('bfloat16' if torch.cuda.is_bf16_supported() else 'float16') if device_type == 'cuda' else 'float32'
+    # Require *native* bf16 (Ampere+, SM 8.0). torch.cuda.is_bf16_supported() also
+    # returns True for pre-Ampere emulation: on a T4 (SM 7.5) a 4096^2 matmul measured
+    # 66ms in bf16 vs 5.2ms in fp16, so trusting it would cost ~12x throughput.
+    dtype = ('bfloat16' if torch.cuda.get_device_capability() >= (8, 0) else 'float16') \
+        if device_type == 'cuda' else 'float32'
 if device_type != 'cuda' and dtype != 'float32':
     print(f"note: {dtype} autocast is not used on {device_type}; using float32")
     dtype = 'float32'
