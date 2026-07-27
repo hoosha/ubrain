@@ -24,7 +24,15 @@ subprocess.run(['git', 'clone', '--depth', '1', '-b', 'main', REPO, CLONE], chec
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'tiktoken', 'wandb'], check=True)
 
 from kaggle_secrets import UserSecretsClient  # noqa: E402  (available only on Kaggle)
-os.environ['WANDB_API_KEY'] = UserSecretsClient().get_secret('WANDB_API_KEY')
+try:
+    os.environ['WANDB_API_KEY'] = UserSecretsClient().get_secret('WANDB_API_KEY')
+except Exception as e:
+    # Secrets are stored per account but must be attached to each kernel that reads
+    # them, so this is the usual first-run failure. Fail loudly before burning GPU time.
+    raise SystemExit(
+        f'could not read the WANDB_API_KEY secret ({e}). In this kernel: '
+        'Edit -> Add-ons -> Secrets -> toggle WANDB_API_KEY on, then re-run.'
+    )
 
 data_dir = os.path.join(CLONE, 'data/finewebedu')
 os.makedirs(data_dir, exist_ok=True)
