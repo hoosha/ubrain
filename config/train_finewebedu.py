@@ -16,9 +16,11 @@
 # product (tokens per iter) fixed so runs stay comparable across machines.
 
 out_dir = 'out-finewebedu'
-eval_interval = 200
-eval_iters = 100
-log_interval = 20
+# Twice the validation resolution at the same total eval cost (20 points instead of
+# 10 for a 2,000-iter run), and frequent enough train logging to watch progress live.
+eval_interval = 100
+eval_iters = 50
+log_interval = 10
 always_save_checkpoint = False
 
 wandb_log = True

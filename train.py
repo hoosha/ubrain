@@ -466,6 +466,11 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+            # Per-iteration training loss, so progress is visible between evals rather
+            # than only at eval_interval. Same step key as the eval row, so W&B merges.
+            wandb.log({'train/batch_loss': lossf, 'system/iter_time_ms': dt * 1000,
+                       'tokens': iter_num * tokens_per_iter, 'lr': lr}, step=iter_num)
     iter_num += 1
     local_iter_num += 1
 
