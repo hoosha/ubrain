@@ -19,8 +19,11 @@ KAGGLE = (shutil.which('kaggle', path=os.path.dirname(sys.executable))
           or shutil.which('kaggle') or 'kaggle')
 
 KERNELS = {
-    'prep': dict(code='prep.py', gpu=False, sources=[]),
-    'train': dict(code='train.py', gpu=True, sources=['{user}/ubrain-prep']),
+    'prep': dict(code='prep.py', gpu=False, sources=[], datasets=[]),
+    # The wandb-key dataset is optional but recommended: UI secret attachments are
+    # dropped whenever a new kernel version is pushed, dataset_sources are not.
+    'train': dict(code='train.py', gpu=True, sources=['{user}/ubrain-prep'],
+                  datasets=['{user}/wandb-key']),
 }
 
 
@@ -40,6 +43,11 @@ def username():
         'could not determine Kaggle username. Run `kaggle auth login`, or set KAGGLE_USERNAME.')
 
 
+def dataset_exists(ref):
+    r = subprocess.run([KAGGLE, 'datasets', 'files', ref], capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def main(which):
     spec = KERNELS[which]
     user = username()
@@ -57,7 +65,9 @@ def main(which):
             'is_private': True,
             'enable_gpu': spec['gpu'],
             'enable_internet': True,
-            'dataset_sources': [],
+            # skip datasets that do not exist yet, otherwise the push itself is rejected
+            'dataset_sources': [d for d in (x.format(user=user) for x in spec['datasets'])
+                                if dataset_exists(d)],
             'kernel_sources': [s.format(user=user) for s in spec['sources']],
             'competition_sources': [],
         }

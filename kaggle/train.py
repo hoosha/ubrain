@@ -23,16 +23,33 @@ GROUP = os.environ.get('WANDB_GROUP', f'finewebedu-screen-s{SEED}')
 subprocess.run(['git', 'clone', '--depth', '1', '-b', 'main', REPO, CLONE], check=True)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'tiktoken', 'wandb'], check=True)
 
-from kaggle_secrets import UserSecretsClient  # noqa: E402  (available only on Kaggle)
-try:
-    os.environ['WANDB_API_KEY'] = UserSecretsClient().get_secret('WANDB_API_KEY')
-except Exception as e:
-    # Secrets are stored per account but must be attached to each kernel that reads
-    # them, so this is the usual first-run failure. Fail loudly before burning GPU time.
-    raise SystemExit(
-        f'could not read the WANDB_API_KEY secret ({e}). In this kernel: '
-        'Edit -> Add-ons -> Secrets -> toggle WANDB_API_KEY on, then re-run.'
-    )
+def wandb_key():
+    """Find the W&B key. Pushing a new kernel version via the API drops the UI secret
+    attachment, so try several sources before giving up."""
+    if os.environ.get('WANDB_API_KEY'):
+        return os.environ['WANDB_API_KEY'], 'env'
+    # A private dataset in dataset_sources survives `kernels push`, unlike a UI secret.
+    for path in ('/kaggle/input/wandb-key/wandb_key.txt', '/kaggle/input/wandb-key/wandb_key'):
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read().strip(), 'dataset'
+    try:
+        from kaggle_secrets import UserSecretsClient  # available only on Kaggle
+        return UserSecretsClient().get_secret('WANDB_API_KEY'), 'secret'
+    except Exception as e:
+        print(f'no W&B key available ({e})', flush=True)
+        return None, None
+
+
+key, source = wandb_key()
+if key:
+    os.environ['WANDB_API_KEY'] = key
+    print(f'W&B key loaded from {source}', flush=True)
+else:
+    # Train anyway and keep the metrics locally; losing hours of GPU time to a missing
+    # credential is worse than losing live dashboards. Sync afterwards with `wandb sync`.
+    os.environ['WANDB_MODE'] = 'offline'
+    print('WARNING: running with WANDB_MODE=offline; metrics will need syncing', flush=True)
 
 data_dir = os.path.join(CLONE, 'data/finewebedu')
 os.makedirs(data_dir, exist_ok=True)
