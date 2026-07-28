@@ -14,18 +14,31 @@ import sys
 
 REPO = 'https://github.com/hoosha/ubrain.git'
 CLONE = '/tmp/ubrain'
-# 2x2 minus the control we already have (plain baseline, val 3.9849 in
-# finewebedu-screen-s1337): {no cross-depth skips, ungated unet skips} x {no block
-# scale, learned}. Run 2 vs run 4 is the comparison that decides whether rewiring adds
-# anything beyond progressive layer wake-up, which is a known-good effect on its own.
-RUNS = (
-    ('baseline', 'learned'),       # 2: does progressive wake-up alone help?
-    ('unet_ungated', 'none'),      # 3: do plain-sum skips alone help?
-    ('unet_ungated', 'learned'),   # 4: the combination
-)
+# Sweeps, selected by ACTIVE. push.py rewrites the ACTIVE line for a variant kernel,
+# so one file serves several sweeps without duplicating the harness below.
+SWEEPS = {
+    # 2x2 minus the control we already have (plain baseline, val 3.9849 in
+    # finewebedu-screen-s1337): {no cross-depth skips, ungated unet skips} x {no block
+    # scale, learned}. Run 2 vs run 4 decides whether rewiring adds anything beyond
+    # progressive layer wake-up, which is a known-good effect on its own.
+    'alive': (
+        dict(residual='baseline', block_scale='learned'),      # does wake-up alone help?
+        dict(residual='unet_ungated', block_scale='none'),     # do plain-sum skips alone?
+        dict(residual='unet_ungated', block_scale='learned'),  # the combination
+    ),
+    # ReZero's selling point is that zero-init block scales remove the need for LR
+    # warmup, so holding warmup_iters=100 may have handicapped both alpha runs -- the
+    # 'alive' pair only reached alpha/sum_abs 2.25 of 24. Same two configs with warmup
+    # removed; everything else identical, so this is a clean two-cell comparison.
+    'nowarmup': (
+        dict(residual='baseline', block_scale='learned', warmup_iters=0, run_suffix='nowarm'),
+        dict(residual='unet_ungated', block_scale='learned', warmup_iters=0, run_suffix='nowarm'),
+    ),
+}
+ACTIVE = 'alive'  # push.py rewrites this line
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')
-GROUP = os.environ.get('WANDB_GROUP', f'finewebedu-alive-s{SEED}')
+GROUP = os.environ.get('WANDB_GROUP', f'finewebedu-{ACTIVE}-s{SEED}')
 
 subprocess.run(['git', 'clone', '--depth', '1', '-b', 'main', REPO, CLONE], check=True)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'tiktoken', 'wandb'], check=True)
@@ -83,20 +96,22 @@ for name in ('train.bin', 'val.bin'):
         os.symlink(src, dst)
     print(name, os.path.getsize(src), 'bytes', flush=True)
 
+BASE = dict(device='cuda', seed=SEED, max_iters=MAX_ITERS, lr_decay_iters=MAX_ITERS,
+            warmup_iters=100, out_dir='/kaggle/working/out', wandb_group=GROUP)
+
 failures = []
-for residual, block_scale in RUNS:
-    print(f'=== residual={residual} block_scale={block_scale} ===', flush=True)
+for spec in SWEEPS[ACTIVE]:
+    args = {**BASE, **spec}   # per-run overrides win over the shared defaults
+    label = '/'.join(f'{k}={v}' for k, v in spec.items())
+    print(f'=== {label} ===', flush=True)
     result = subprocess.run(
-        [sys.executable, 'train.py', 'config/train_finewebedu.py',
-         '--device=cuda', f'--residual={residual}', f'--block_scale={block_scale}',
-         f'--seed={SEED}',
-         f'--max_iters={MAX_ITERS}', f'--lr_decay_iters={MAX_ITERS}', '--warmup_iters=100',
-         '--out_dir=/kaggle/working/out', f'--wandb_group={GROUP}'],
+        [sys.executable, 'train.py', 'config/train_finewebedu.py']
+        + [f'--{k}={v}' for k, v in args.items()],
         cwd=CLONE,
     )
     if result.returncode != 0:
-        failures.append(f'{residual}/{block_scale}')
-        print(f'!! {residual}/{block_scale} exited {result.returncode}', flush=True)
+        failures.append(label)
+        print(f'!! {label} exited {result.returncode}', flush=True)
 
 print('done. failures:', failures or 'none')
 sys.exit(1 if failures else 0)

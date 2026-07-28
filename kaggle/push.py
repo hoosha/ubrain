@@ -8,6 +8,7 @@ whichever Kaggle account is authenticated.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,11 @@ KERNELS = {
     # available"). Triton also needs sm_70+ for torch.compile.
     'train': dict(code='train.py', gpu=True, sources=[], accelerator='NvidiaTeslaT4',
                   datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
+    # a second kernel over the same harness, so it can run while 'train' is still busy
+    # instead of re-pushing that one and cancelling its in-flight run
+    'train-nowarmup': dict(code='train.py', gpu=True, sources=[], sweep='nowarmup',
+                           accelerator='NvidiaTeslaT4',
+                           datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
 }
 
 
@@ -58,8 +64,14 @@ def main(which):
     with tempfile.TemporaryDirectory() as tmp:
         # kaggle kernels push requires the code file and metadata in one directory
         code = spec['code']
-        with open(os.path.join(HERE, code)) as src, open(os.path.join(tmp, code), 'w') as dst:
-            dst.write(src.read())
+        with open(os.path.join(HERE, code)) as src:
+            body = src.read()
+        if spec.get('sweep'):   # point this kernel's copy at a different sweep
+            body, n = re.subn(r"^ACTIVE = .*$", f"ACTIVE = {spec['sweep']!r}", body, flags=re.M)
+            if n != 1:
+                raise SystemExit(f'expected one ACTIVE line in {code}, found {n}')
+        with open(os.path.join(tmp, code), 'w') as dst:
+            dst.write(body)
         meta = {
             'id': f'{user}/ubrain-{which}',
             'title': f'ubrain-{which}',

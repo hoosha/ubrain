@@ -65,6 +65,9 @@ residual = 'baseline' # baseline|dense|unet|dense_ungated|unet_ungated
 # training instead of being fully on from step 0 (ReZero / LayerScale).
 block_scale = 'none' # 'none' | 'learned'
 seed = 1337 # vary this for multi-seed runs
+# appended to run_name/out_dir; use it when a run differs by something the variant label
+# does not encode (e.g. warmup_iters), which would otherwise collide with an earlier run
+run_suffix = ''
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -111,7 +114,7 @@ if device == 'auto':
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 if unique_out_dir:
     tag = f"{arch}-{norm_placement}-{variant_label(residual, block_scale)}"
-    out_dir = os.path.join(out_dir, f"{tag}-L{n_layer}-s{seed}")
+    out_dir = os.path.join(out_dir, f"{tag}-L{n_layer}-s{seed}{'-' + run_suffix if run_suffix else ''}")
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
@@ -345,7 +348,8 @@ running_mfu = -1.0
 # parameters but do keep early block outputs alive, which costs memory.
 run_cfg = raw_model.config # authoritative on resume; CLI globals may describe another model
 variant = variant_label(run_cfg.residual, run_cfg.block_scale)
-run_name = f"{run_cfg.arch}-{run_cfg.norm_placement}-{variant}-L{run_cfg.n_layer}-s{seed}"
+run_name = (f"{run_cfg.arch}-{run_cfg.norm_placement}-{variant}-L{run_cfg.n_layer}-s{seed}"
+            f"{'-' + run_suffix if run_suffix else ''}")
 n_params = raw_model.get_num_params()
 total_params = raw_model.get_num_params(non_embedding=False)
 flops_per_token = raw_model.flops_per_token()
