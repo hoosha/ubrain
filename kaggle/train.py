@@ -52,11 +52,18 @@ SWEEPS = {
         dict(residual='unet_ungated', block_scale='learned', warmup_iters=0,
              run_suffix='flat-nowarm'),
     ),
+    # The central hypothesis: can a *shallower* model with rewired skips match a deeper
+    # sequential baseline? Half the depth against the 12-layer flat baseline, with its own
+    # 6-layer control so the comparison is depth-vs-skips rather than depth alone.
+    'shallow': (
+        dict(residual='baseline', n_layer=6, run_suffix='flat'),
+        dict(residual='dense', n_layer=6, run_suffix='flat'),
+    ),
 }
 # per-sweep overrides layered between BASE and each run's own spec
-SWEEP_BASE = {'flat_a': dict(lr_schedule='constant'), 'flat_b': dict(lr_schedule='constant')}
+SWEEP_BASE = {k: dict(lr_schedule='constant') for k in ('flat_a', 'flat_b', 'shallow')}
 # sweeps that share a W&B group, so runs split across kernels still compare in one place
-SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat'}
+SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat', 'shallow': 'flat'}
 ACTIVE = 'alive'  # push.py rewrites this line
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')

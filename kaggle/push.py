@@ -38,8 +38,15 @@ KERNELS = {
     'train-flat-a': dict(code='train.py', gpu=True, sources=[], sweep='flat_a',
                          accelerator='NvidiaTeslaT4',
                          datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
+    # kernel_id reuses an existing slug: creating ubrain-train-flat-b returned
+    # "Notebook not found" repeatedly (ubrain-train-flat-a created fine), so this rides
+    # the idle nowarmup kernel. The slug therefore does not match the sweep it runs --
+    # the W&B group (finewebedu-flat-s1337) is the thing to trust.
+    'train-shallow': dict(code='train.py', gpu=True, sources=[], sweep='shallow',
+                          kernel_id='ubrain-train-flat-a', accelerator='NvidiaTeslaT4',
+                          datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
     'train-flat-b': dict(code='train.py', gpu=True, sources=[], sweep='flat_b',
-                         accelerator='NvidiaTeslaT4',
+                         kernel_id='ubrain-train-nowarmup', accelerator='NvidiaTeslaT4',
                          datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
 }
 
@@ -104,8 +111,8 @@ def main(which):
         with open(os.path.join(tmp, code), 'w') as dst:
             dst.write(body)
         meta = {
-            'id': f'{user}/ubrain-{which}',
-            'title': f'ubrain-{which}',
+            'id': f"{user}/{spec.get('kernel_id', f'ubrain-{which}')}",
+            'title': spec.get('kernel_id', f'ubrain-{which}'),
             'code_file': code,
             'language': 'python',
             'kernel_type': 'script',
