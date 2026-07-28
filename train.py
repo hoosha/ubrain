@@ -60,7 +60,10 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # architecture / experiment knobs
 arch = 'gpt2' # 'gpt2' reproduces the published baseline; 'modern' = RMSNorm+RoPE+SwiGLU+QK-Norm
 norm_placement = 'pre' # 'pre' or 'peri'
-residual = 'baseline' # 'baseline' | 'dense' | 'unet' | 'dense_ungated'
+residual = 'baseline' # baseline|dense|unet|dense_ungated|unet_ungated
+# 'learned': zero-init scale on each sublayer output, so layers come alive during
+# training instead of being fully on from step 0 (ReZero / LayerScale).
+block_scale = 'none' # 'none' | 'learned'
 seed = 1337 # vary this for multi-seed runs
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -91,7 +94,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 if device == 'auto':
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 if unique_out_dir:
-    out_dir = os.path.join(out_dir, f"{arch}-{norm_placement}-{residual}-L{n_layer}-s{seed}")
+    tag = f"{arch}-{norm_placement}-{residual}{'-ls' if block_scale == 'learned' else ''}"
+    out_dir = os.path.join(out_dir, f"{tag}-L{n_layer}-s{seed}")
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
@@ -188,7 +192,8 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  arch=arch, norm_placement=norm_placement, residual=residual) # start with model_args from command line
+                  arch=arch, norm_placement=norm_placement, residual=residual,
+                  block_scale=block_scale) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -212,7 +217,8 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # Backward-compatible with upstream checkpoints created before these knobs existed.
-    for k, default in [('arch', 'gpt2'), ('norm_placement', 'pre'), ('residual', 'baseline')]:
+    for k, default in [('arch', 'gpt2'), ('norm_placement', 'pre'), ('residual', 'baseline'),
+                       ('block_scale', 'none')]:
         model_args[k] = checkpoint_model_args.get(k, default)
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -233,7 +239,8 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'arch', 'norm_placement', 'residual']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'arch',
+              'norm_placement', 'residual', 'block_scale']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -321,7 +328,9 @@ running_mfu = -1.0
 # without re-running anything. These can disagree: cross-depth skips add ~no
 # parameters but do keep early block outputs alive, which costs memory.
 run_cfg = raw_model.config # authoritative on resume; CLI globals may describe another model
-run_name = f"{run_cfg.arch}-{run_cfg.norm_placement}-{run_cfg.residual}-L{run_cfg.n_layer}-s{seed}"
+run_name = (f"{run_cfg.arch}-{run_cfg.norm_placement}-{run_cfg.residual}"
+            f"{'-ls' if run_cfg.block_scale == 'learned' else ''}"
+            f"-L{run_cfg.n_layer}-s{seed}")
 n_params = raw_model.get_num_params()
 total_params = raw_model.get_num_params(non_embedding=False)
 flops_per_token = raw_model.flops_per_token()
@@ -337,7 +346,8 @@ def log_metrics(**kw):
     if not master_process:
         return
     record = dict(run=run_name, arch=run_cfg.arch, norm_placement=run_cfg.norm_placement,
-                  residual=run_cfg.residual, n_layer=run_cfg.n_layer, n_embd=run_cfg.n_embd,
+                  residual=run_cfg.residual, block_scale=run_cfg.block_scale,
+                  n_layer=run_cfg.n_layer, n_embd=run_cfg.n_embd,
                   seed=seed, dataset=dataset,
                   device_type=device_type, dtype=dtype, params=n_params,
                   total_params=total_params, flops_per_token=flops_per_token,
@@ -394,6 +404,9 @@ def gate_metrics():
             grads.append(gr)
     if not vals:
         return {}, None
+    # ungated variants hold their coefficients fixed, so there is no optimizer state and
+    # no gradient to report; say so rather than printing an absence that reads as a fault
+    out['gate/trainable'] = int(any(g.requires_grad for g in raw_model.skip_gate))
     allv = torch.cat(vals)
     out['gate/rms_all'] = allv.pow(2).mean().sqrt().item()
     out['gate/absmax_all'] = allv.abs().max().item()
@@ -403,6 +416,47 @@ def gate_metrics():
         out['gate/grad_rms_all'] = torch.cat(grads).mean().item()
         out['gate/grad_dead_edges'] = int((torch.cat(grads) == 0).sum())
     return out, allv
+
+def block_scale_metrics():
+    """Per-sublayer alpha and the gradient reaching it.
+
+    This is the primary observable for the "layers come alive" question: alpha=0 means
+    the sublayer is switched off entirely, so the trajectory says *which* layers wake up
+    and *when*. Same Adam-second-moment gradient proxy and the same reason as
+    gate_metrics(): p.grad is None at eval time.
+    """
+    blocks = raw_model.transformer.h
+    if not getattr(blocks[0], 'scaled', False):
+        return {}, None
+    out, vals, grads, prof = {}, [], [], []
+    for i, b in enumerate(blocks):
+        for tag, p in (('attn', b.ls_1), ('mlp', b.ls_2)):
+            v = p.detach().float().cpu()
+            out[f'alpha/v/L{i}_{tag}'] = v.mean().item()
+            vals.append(v.reshape(-1))
+            prof.append((i, v.abs().mean().item()))
+            st = optimizer.state.get(p, {})
+            if 'exp_avg_sq' in st:
+                g = st['exp_avg_sq'].detach().float().cpu().sqrt().reshape(-1)
+                out[f'alpha/grad_rms/L{i}_{tag}'] = g.mean().item()
+                grads.append(g)
+    allv = torch.cat(vals)
+    mass = sum(m for _, m in prof)
+    out['alpha/mean_abs'] = allv.abs().mean().item()
+    out['alpha/max_abs'] = allv.abs().max().item()
+    # total computation switched on: at 0 the net is a pure residual chain, at 24 every
+    # sublayer contributes at unit scale
+    out['alpha/sum_abs'] = mass
+    out['alpha/frac_alive'] = (allv.abs() > 0.01).float().mean().item()
+    # where the live mass sits in depth: below (n_layer-1)/2 means shallow layers woke
+    # first, above it means deep ones did
+    out['alpha/depth_centroid'] = (sum(i * m for i, m in prof) / mass) if mass else 0.0
+    if grads:
+        g = torch.cat(grads)
+        out['alpha/grad_rms_all'] = g.mean().item()
+        out['alpha/grad_dead'] = int((g == 0).sum())
+    return out, allv
+
 
 def upload_checkpoint(reason):
     """Persist ckpt.pt to W&B so a run survives an ephemeral runtime being reclaimed."""
@@ -428,20 +482,28 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         gates, gate_values = gate_metrics()
+        alphas, alpha_values = block_scale_metrics()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
               # 'grad n/a' only at iter 0, before the optimizer has any state to read;
               # printing 0 there would look identical to the dead-gradient failure case
               + (f", gate rms {gates['gate/rms_all']:.4f}"
                  + (f", grad {gates['gate/grad_rms_all']:.2e}, dead {gates['gate/grad_dead_edges']}"
-                    if 'gate/grad_rms_all' in gates else ', grad n/a') if gates else ''))
+                    if 'gate/grad_rms_all' in gates
+                    else ('' if not gates['gate/trainable'] else ', grad n/a')) if gates else '')
+              + (f", alive {alphas['alpha/sum_abs']:.2f}/{2 * run_cfg.n_layer}"
+                 f" depth {alphas['alpha/depth_centroid']:.2f}"
+                 + (f" grad {alphas['alpha/grad_rms_all']:.2e} dead {alphas['alpha/grad_dead']}"
+                    if 'alpha/grad_rms_all' in alphas else ' grad n/a') if alphas else ''))
         log_metrics(iter=iter_num, train_loss=losses['train'], val_loss=losses['val'],
                     best_val_loss=min(best_val_loss, losses['val'].item()), lr=lr,
                     tokens=iter_num * tokens_per_iter,
-                    total_flops=flops_per_token * iter_num * tokens_per_iter, **gates)
+                    total_flops=flops_per_token * iter_num * tokens_per_iter,
+                    **gates, **alphas)
         if wandb_log:
             wandb.log({
-                **gates,
-                **({'gate/values': wandb.Histogram(gate_values.tolist())} if wandb_log and gates else {}),
+                **gates, **alphas,
+                **({'gate/values': wandb.Histogram(gate_values.tolist())} if gates else {}),
+                **({'alpha/values': wandb.Histogram(alpha_values.tolist())} if alphas else {}),
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
@@ -539,7 +601,8 @@ if master_process:
     log_metrics(iter=iter_num, final=True, best_val_loss=best_val_loss,
                 tokens=iter_num * tokens_per_iter,
                 total_flops=flops_per_token * iter_num * tokens_per_iter,
-                **gate_metrics()[0]) # final gate state is a headline result, not a side metric
+                # final gate/alpha state is a headline result, not a side metric
+                **gate_metrics()[0], **block_scale_metrics()[0])
     print(f"done {run_name}: best val loss {float(best_val_loss):.4f} "
           f"in {time.time() - t_start:.0f}s, peak mem {peak_memory_bytes()/1e9:.2f}GB")
 

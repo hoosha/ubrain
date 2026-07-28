@@ -127,6 +127,86 @@ def test_gate_gradients_are_nonzero():
         print(f"  {variant}: all {edges} gate gradients nonzero at init")
 
 
+def _mk(**kw):
+    torch.manual_seed(1337)
+    cfg = dict(n_layer=6, n_head=2, n_embd=64, block_size=32, arch='modern',
+               dropout=0.0, vocab_size=64)
+    return GPT(GPTConfig(**{**cfg, **kw}))
+
+
+def test_ungated_skips_are_fixed_plain_sums():
+    """unet_ungated must be a plain sum with no gate to learn: coefficient exactly 1,
+    requires_grad False. dense_ungated stays on 1/(n+1) averaging, because summing every
+    earlier state at coefficient 1 compounds geometrically."""
+    m = _mk(residual='unet_ungated')
+    edges = 0
+    for i, g in enumerate(m.skip_gate):
+        if g.numel() == 0:
+            continue
+        assert not g.requires_grad, f'L{i} is trainable; ungated must be fixed'
+        assert torch.equal(g, torch.ones_like(g)), f'L{i} = {g.tolist()}, expected 1.0'
+        edges += g.numel()
+    assert edges == 3, edges
+    d = _mk(residual='dense_ungated')
+    assert abs(d.skip_gate[2][0].item() - 1/3) < 1e-6, d.skip_gate[2]
+
+
+def test_block_scale_starts_the_network_as_identity():
+    """alpha=0 must make every block an exact identity, so the network is a pure chain of
+    the ordinary intra-block residuals and layers wake up from there."""
+    m = _mk(block_scale='learned')
+    for i, b in enumerate(m.transformer.h):
+        assert b.ls_1.item() == 0.0 and b.ls_2.item() == 0.0, i
+        x = torch.randn(2, 8, 64)
+        assert torch.equal(b(x), x), f'block {i} is not the identity at alpha=0'
+
+
+def test_block_scale_makes_the_stream_a_scalar_multiple_of_the_embedding():
+    """At alpha=0 no block contributes, so the stream entering the final norm is exactly
+    a positive multiple of the embedding: 1x for baseline, and for unet_ungated the plain
+    sums accumulate 1,1,1,1,1,1,2,3,4,5,6,7 -- linear in depth, not exponential, which is
+    what makes coefficient 1.0 safe on a sparse topology.
+
+    Note what this does NOT give: matched logits between the two. RMSNorm is only
+    scale-invariant up to its epsilon, and with the 0.02 embedding init mean(e^2) is
+    ~4e-4, so eps=1e-5 is ~2.5% of it -- the logits end up ~1% apart, not identical.
+    """
+    for residual, want in (('baseline', 1.0), ('unet_ungated', 7.0)):
+        m = _mk(n_layer=12, residual=residual, block_scale='learned')
+        seen = {}
+        m.transformer.ln_f.register_forward_pre_hook(
+            lambda _mod, inp, seen=seen: seen.setdefault('h', inp[0]))
+        x = torch.randint(0, 64, (2, 32))
+        with torch.no_grad():
+            m(x)
+            e = m.transformer.wte(x)
+        ratio = (seen['h'] / e)
+        assert torch.allclose(ratio, torch.full_like(ratio, want), atol=1e-5), \
+            f'{residual}: stream/embedding = {ratio.mean().item():.4f}, expected {want}'
+
+
+def test_block_scale_gradients_are_nonzero():
+    """A zero-init alpha that never receives gradient is a layer that can never wake up."""
+    for residual in ('baseline', 'unet_ungated'):
+        m = _mk(residual=residual, block_scale='learned')
+        x = torch.randint(0, 64, (2, 32))
+        m(x, x)[1].backward()
+        for i, b in enumerate(m.transformer.h):
+            for tag, p in (('attn', b.ls_1), ('mlp', b.ls_2)):
+                assert p.grad is not None and p.grad.abs().item() > 0, \
+                    f'{residual} L{i} {tag}: alpha gradient {p.grad}'
+
+
+def test_block_scale_is_undecayed():
+    """alpha=0 IS the switched-off network, so weight decay would apply a standing force
+    pulling every layer back toward off."""
+    m = _mk(residual='unet_ungated', block_scale='learned')
+    groups = m.configure_optimizers(0.1, 6e-4, (0.9, 0.95), 'cpu').param_groups
+    decayed = {id(p) for g in groups if g['weight_decay'] > 0 for p in g['params']}
+    for i, b in enumerate(m.transformer.h):
+        assert id(b.ls_1) not in decayed and id(b.ls_2) not in decayed, i
+
+
 if __name__ == '__main__':
     import contextlib, io
     for name, fn in sorted(globals().items()):

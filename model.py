@@ -162,12 +162,24 @@ class Block(nn.Module):
         if self.peri:
             self.ln_1_post = norm(config.n_embd, bias=config.bias)
             self.ln_2_post = norm(config.n_embd, bias=config.bias)
+        # Zero-init scale on each sublayer's *output* (ReZero / LayerScale). At alpha=0
+        # the block is the identity, so the network starts as a pure chain of the
+        # ordinary intra-block residuals and layers come alive as alpha grows. One
+        # scalar per sublayer, so alpha is directly readable as "how alive is this
+        # sublayer"; dim()<2 puts it in the no-decay group, which matters because
+        # alpha=0 is a meaningful point that weight decay would pull it back toward.
+        self.scaled = config.block_scale == 'learned'
+        if self.scaled:
+            self.ls_1 = nn.Parameter(torch.zeros(1))
+            self.ls_2 = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         a = self.attn(self.ln_1(x))
-        x = x + (self.ln_1_post(a) if self.peri else a)
+        a = self.ln_1_post(a) if self.peri else a
+        x = x + (self.ls_1 * a if self.scaled else a)
         m = self.mlp(self.ln_2(x))
-        x = x + (self.ln_2_post(m) if self.peri else m)
+        m = self.ln_2_post(m) if self.peri else m
+        x = x + (self.ls_2 * m if self.scaled else m)
         return x
 
 def skip_sources(residual, n_layer):
@@ -178,18 +190,26 @@ def skip_sources(residual, n_layer):
     stream value at block i is outs[i], and valid skip sources are indices < i.
 
     - dense / dense_ungated: block i reads every earlier stream state.
-    - unet: mirror pattern. Block i in the second half reads outs[n_layer-1-i],
-      i.e. the input of its mirrored encoder block. Reading the mirrored block's
-      *input* rather than its output matters: for i = n_layer//2 the mirrored
-      output is outs[i] itself, which would degenerate into just doubling x.
+    - unet / unet_ungated: mirror pattern. Block i in the second half reads
+      outs[n_layer-1-i], i.e. the input of its mirrored encoder block. Reading the
+      mirrored block's *input* rather than its output matters: for i = n_layer//2 the
+      mirrored output is outs[i] itself, which would degenerate into just doubling x.
     """
     if residual == 'baseline':
         return [[] for _ in range(n_layer)]
     if residual in ('dense', 'dense_ungated'):
         return [list(range(i)) for i in range(n_layer)]
-    if residual == 'unet':
+    if residual in ('unet', 'unet_ungated'):
         return [[n_layer - 1 - i] if i >= (n_layer + 1) // 2 else [] for i in range(n_layer)]
     raise ValueError(f"unknown residual variant: {residual}")
+
+
+# Fixed, untrained skip coefficients. 'sum' is a plain sum: the skip is simply part of
+# the block's input, no gate to learn. Safe for a sparse topology -- U-Net gives each
+# block one extra term, so the stream grows linearly with depth (7x at 12 layers), not
+# exponentially. 'mean' is required for dense, where summing every earlier state at
+# coefficient 1 would compound geometrically.
+UNGATED = {'dense_ungated': 'mean', 'unet_ungated': 'sum'}
 
 @dataclass
 class GPTConfig:
@@ -202,7 +222,8 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     arch: str = 'gpt2' # 'gpt2': faithful to the published baseline. 'modern': RMSNorm+RoPE+SwiGLU+QK-Norm
     norm_placement: str = 'pre' # 'pre' or 'peri'
-    residual: str = 'baseline' # 'baseline' | 'dense' | 'unet' | 'dense_ungated'
+    residual: str = 'baseline' # baseline|dense|unet|dense_ungated|unet_ungated
+    block_scale: str = 'none' # 'none' | 'learned': zero-init scale on each sublayer output
 
     def __post_init__(self):
         assert self.arch in ('gpt2', 'modern')
@@ -254,12 +275,16 @@ class GPT(nn.Module):
         self.skip_src = skip_sources(config.residual, config.n_layer)
         self.skip_gate = None
         if any(self.skip_src):
-            ungated = config.residual == 'dense_ungated'
+            mode = UNGATED.get(config.residual)  # None => learned gates, zero-init
+            def coeff(src):
+                if mode == 'sum':
+                    return torch.ones(len(src))
+                if mode == 'mean':
+                    return torch.full((len(src),), 1.0 / (len(src) + 1))
+                return torch.zeros(len(src))
             self.skip_gate = nn.ParameterList([
-                nn.Parameter(
-                    torch.full((len(src),), 1.0 / (len(src) + 1)) if ungated else torch.zeros(len(src)),
-                    requires_grad=bool(src) and not ungated,
-                ) for src in self.skip_src
+                nn.Parameter(coeff(src), requires_grad=bool(src) and mode is None)
+                for src in self.skip_src
             ])
 
         # init all weights

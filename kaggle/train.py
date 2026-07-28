@@ -14,10 +14,18 @@ import sys
 
 REPO = 'https://github.com/hoosha/ubrain.git'
 CLONE = '/tmp/ubrain'
-VARIANTS = ('baseline', 'dense', 'unet')
+# 2x2 minus the control we already have (plain baseline, val 3.9849 in
+# finewebedu-screen-s1337): {no cross-depth skips, ungated unet skips} x {no block
+# scale, learned}. Run 2 vs run 4 is the comparison that decides whether rewiring adds
+# anything beyond progressive layer wake-up, which is a known-good effect on its own.
+RUNS = (
+    ('baseline', 'learned'),       # 2: does progressive wake-up alone help?
+    ('unet_ungated', 'none'),      # 3: do plain-sum skips alone help?
+    ('unet_ungated', 'learned'),   # 4: the combination
+)
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')
-GROUP = os.environ.get('WANDB_GROUP', f'finewebedu-screen-s{SEED}')
+GROUP = os.environ.get('WANDB_GROUP', f'finewebedu-alive-s{SEED}')
 
 subprocess.run(['git', 'clone', '--depth', '1', '-b', 'main', REPO, CLONE], check=True)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'tiktoken', 'wandb'], check=True)
@@ -76,18 +84,19 @@ for name in ('train.bin', 'val.bin'):
     print(name, os.path.getsize(src), 'bytes', flush=True)
 
 failures = []
-for residual in VARIANTS:
-    print(f'=== residual={residual} ===', flush=True)
+for residual, block_scale in RUNS:
+    print(f'=== residual={residual} block_scale={block_scale} ===', flush=True)
     result = subprocess.run(
         [sys.executable, 'train.py', 'config/train_finewebedu.py',
-         '--device=cuda', f'--residual={residual}', f'--seed={SEED}',
+         '--device=cuda', f'--residual={residual}', f'--block_scale={block_scale}',
+         f'--seed={SEED}',
          f'--max_iters={MAX_ITERS}', f'--lr_decay_iters={MAX_ITERS}', '--warmup_iters=100',
          '--out_dir=/kaggle/working/out', f'--wandb_group={GROUP}'],
         cwd=CLONE,
     )
     if result.returncode != 0:
-        failures.append(residual)
-        print(f'!! residual={residual} exited {result.returncode}', flush=True)
+        failures.append(f'{residual}/{block_scale}')
+        print(f'!! {residual}/{block_scale} exited {result.returncode}', flush=True)
 
 print('done. failures:', failures or 'none')
 sys.exit(1 if failures else 0)
