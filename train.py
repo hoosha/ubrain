@@ -363,6 +363,47 @@ if wandb_log and master_process:
 
 eval_count = 0
 
+def gate_metrics():
+    """Per-edge skip-gate values and the gradient actually reaching them.
+
+    Zero-init gates mean a variant that never opens them is identical to the baseline,
+    so a null result is ambiguous without this: "no gradient arrived" (a bug) has to be
+    distinguishable from "gradient arrived and the network declined the edge".
+
+    The gradient proxy is Adam's second moment rather than p.grad, which is None here
+    because zero_grad(set_to_none=True) ran after the last step; sqrt(exp_avg_sq) is
+    also a smoothed estimate rather than one micro-batch's noise.
+    """
+    if raw_model.skip_gate is None:
+        return {}, None
+    out, vals, grads = {}, [], []
+    for i, g in enumerate(raw_model.skip_gate):
+        if g.numel() == 0:
+            continue
+        v = g.detach().float().cpu()
+        out[f'gate/rms/L{i}'] = v.pow(2).mean().sqrt().item()
+        out[f'gate/absmax/L{i}'] = v.abs().max().item()
+        # every edge individually: which ones open is the result, not an aggregate of it
+        for k, s in enumerate(raw_model.skip_src[i]):
+            out[f'gate/e/L{i}_t{s}'] = v[k].item()
+        vals.append(v)
+        st = optimizer.state.get(g, {})
+        if 'exp_avg_sq' in st:
+            gr = st['exp_avg_sq'].detach().float().cpu().sqrt()
+            out[f'gate/grad_rms/L{i}'] = gr.mean().item()
+            grads.append(gr)
+    if not vals:
+        return {}, None
+    allv = torch.cat(vals)
+    out['gate/rms_all'] = allv.pow(2).mean().sqrt().item()
+    out['gate/absmax_all'] = allv.abs().max().item()
+    # a run whose gates never leave zero is a baseline in disguise; make that one number
+    out['gate/frac_open'] = (allv.abs() > 0.01).float().mean().item()
+    if grads:
+        out['gate/grad_rms_all'] = torch.cat(grads).mean().item()
+        out['gate/grad_dead_edges'] = int((torch.cat(grads) == 0).sum())
+    return out, allv
+
 def upload_checkpoint(reason):
     """Persist ckpt.pt to W&B so a run survives an ephemeral runtime being reclaimed."""
     if not (wandb_log and master_process):
@@ -386,13 +427,21 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        gates, gate_values = gate_metrics()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+              # 'grad n/a' only at iter 0, before the optimizer has any state to read;
+              # printing 0 there would look identical to the dead-gradient failure case
+              + (f", gate rms {gates['gate/rms_all']:.4f}"
+                 + (f", grad {gates['gate/grad_rms_all']:.2e}, dead {gates['gate/grad_dead_edges']}"
+                    if 'gate/grad_rms_all' in gates else ', grad n/a') if gates else ''))
         log_metrics(iter=iter_num, train_loss=losses['train'], val_loss=losses['val'],
                     best_val_loss=min(best_val_loss, losses['val'].item()), lr=lr,
                     tokens=iter_num * tokens_per_iter,
-                    total_flops=flops_per_token * iter_num * tokens_per_iter)
+                    total_flops=flops_per_token * iter_num * tokens_per_iter, **gates)
         if wandb_log:
             wandb.log({
+                **gates,
+                **({'gate/values': wandb.Histogram(gate_values.tolist())} if wandb_log and gates else {}),
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
@@ -489,7 +538,8 @@ while True:
 if master_process:
     log_metrics(iter=iter_num, final=True, best_val_loss=best_val_loss,
                 tokens=iter_num * tokens_per_iter,
-                total_flops=flops_per_token * iter_num * tokens_per_iter)
+                total_flops=flops_per_token * iter_num * tokens_per_iter,
+                **gate_metrics()[0]) # final gate state is a headline result, not a side metric
     print(f"done {run_name}: best val loss {float(best_val_loss):.4f} "
           f"in {time.time() - t_start:.0f}s, peak mem {peak_memory_bytes()/1e9:.2f}GB")
 

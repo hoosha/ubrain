@@ -107,6 +107,26 @@ def test_shallow_variant_vs_deep_baseline_params():
     assert shallow_dense.get_num_params() < deep.get_num_params()
 
 
+def test_gate_gradients_are_nonzero():
+    """A zero-init variant that never receives gate gradient is a baseline in disguise.
+    Catch that here rather than after a multi-hour run reports a false null result."""
+    for variant in ('dense', 'unet'):
+        torch.manual_seed(1337)
+        m = GPT(GPTConfig(n_layer=6, n_head=2, n_embd=64, block_size=32,
+                          arch='modern', residual=variant, dropout=0.0, vocab_size=64))
+        x = torch.randint(0, 64, (2, 32))
+        m(x, x)[1].backward()
+        edges = 0
+        for i, g in enumerate(m.skip_gate):
+            if g.numel() == 0:
+                continue
+            assert g.grad is not None, f"{variant} L{i}: no gradient reached the gate"
+            assert (g.grad != 0).all(), f"{variant} L{i}: zero gate gradient {g.grad}"
+            edges += g.numel()
+        assert edges == sum(map(len, skip_sources(variant, 6))), variant
+        print(f"  {variant}: all {edges} gate gradients nonzero at init")
+
+
 if __name__ == '__main__':
     import contextlib, io
     for name, fn in sorted(globals().items()):
