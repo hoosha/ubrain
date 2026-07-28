@@ -143,8 +143,67 @@ def arch_svg(mat, it, n_layer, vmax):
             f'{"".join(parts)}</figure>')
 
 
-def grid(panels, vmax, n_layer, signed, arch=False):
-    cells = [arch_svg(m, it, n_layer, vmax) for _a, it, m in panels] if arch else []
+def arch_svg_u(mat, it, n_layer, vmax):
+    """The U-Net folded at its midpoint: encoder descending, decoder ascending beside
+    it, so mirrored blocks sit on the same row and their skip is a short crossbar.
+
+    This is the shape the topology is named for. The flat layout draws the same edges
+    as nested arches, and the matrix as an anti-diagonal; neither looks like a U.
+
+    Flow runs *down* the left arm and *up* the right one, so a left block's input wire
+    is above it while a right block's is below. The crossbars therefore slant slightly
+    rather than being truly horizontal -- that is the honest geometry: each one runs
+    from the wire entering B_r to the wire entering its mirror.
+    """
+    h = (n_layer + 1) // 2
+    PITCH, TOP, BOX_W, BOX_H = 48, 44, 46, 22
+    XL, XR = 62, 214
+    W, H = XR + 68, TOP + PITCH * h + 66
+
+    def y_row(r):
+        return TOP + PITCH * r
+
+    lo_l = y_row(h - 1) + BOX_H                  # bottom of the encoder arm
+    lo_r = y_row(n_layer - 1 - h) + BOX_H        # bottom of the decoder arm (may differ if odd)
+    y_bot = max(lo_l, lo_r) + 26
+
+    p = [f'<svg viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
+         f'aria-label="U-Net folded topology, crossbars coloured by gate value">']
+    # the sequential path, as one stroke: down the left arm, round the bottom, up the right
+    p.append(f'<path class="stream" fill="none" d="M {XL} {TOP - 22} L {XL} {lo_l} '
+             f'L {XL} {y_bot} L {XR} {y_bot} L {XR} {lo_r} L {XR} {TOP - 22}"/>')
+    p.append(f'<text x="{XL}" y="{TOP - 28}" class="lbl" text-anchor="middle">embed</text>')
+    p.append(f'<text x="{XR}" y="{TOP - 28}" class="lbl" text-anchor="middle">logits</text>')
+
+    for r in range(h):
+        i = n_layer - 1 - r                      # the decoder block mirroring encoder block r
+        if i < h:
+            continue
+        v = mat[i][r]
+        if v is None:
+            continue
+        y0, y1 = y_row(r) - 12, y_row(r) + BOX_H + 12
+        p.append(f'<line x1="{XL + BOX_W / 2}" y1="{y0}" x2="{XR - BOX_W / 2}" y2="{y1}" '
+                 f'stroke="{colour(v, vmax)}" stroke-width="{1 + 4 * abs(v) / vmax:.2f}">'
+                 f'<title>B{i} &larr; t{r}: {v:+.4f}</title></line>')
+        p.append(f'<text x="{(XL + XR) / 2}" y="{(y0 + y1) / 2 - 4}" class="lbl" '
+                 f'text-anchor="middle">{v:+.2f}</text>')
+
+    for i in range(n_layer):
+        x = XL if i < h else XR
+        r = i if i < h else n_layer - 1 - i
+        p.append(f'<rect x="{x - BOX_W / 2}" y="{y_row(r)}" width="{BOX_W}" '
+                 f'height="{BOX_H}" rx="3" class="blk"/>')
+        p.append(f'<text x="{x}" y="{y_row(r) + 15}" class="blbl" '
+                 f'text-anchor="middle">B{i}</text>')
+    p.append('</svg>')
+    return (f'<figure><figcaption>topology, folded &mdash; iter {it}</figcaption>'
+            f'{"".join(p)}</figure>')
+
+
+def grid(panels, vmax, n_layer, signed, arch='none'):
+    draw = {'linear': arch_svg, 'u': arch_svg_u}.get(arch)
+    cells = [draw(m, it, n_layer, vmax) for _a, it, m in panels] if draw else []
     for _args, it, mat in panels:
         rows = []
         for i in range(1, n_layer):
@@ -169,7 +228,7 @@ def _rgb(hexstr):
     return tuple(int(hexstr[k:k + 2], 16) for k in (1, 3, 5))
 
 
-def html(panels, vmax, n_layer):
+def html(panels, vmax, n_layer, arch):
     steps = [-vmax + 2 * vmax * k / 16 for k in range(17)]
     leg_signed = ''.join(f'<span style="background:{colour(v, vmax)}"></span>' for v in steps)
     leg_abs = ''.join(f'<span style="background:{colour(vmax * k / 16, vmax, False)}"></span>'
@@ -213,7 +272,7 @@ anything.</p>
 <h2>Signed &mdash; direction of the edge</h2>
 <p>Diverging scale, symmetric at &plusmn;{vmax:.2f}. Blue adds the earlier state,
 red subtracts it, gray is an unused edge.</p>
-{grid(panels, vmax, n_layer, True, arch=True)}
+{grid(panels, vmax, n_layer, True, arch)}
 <div class=legend>{-vmax:+.2f}<span class=bar>{leg_signed}</span>{vmax:+.2f}
 &nbsp;&nbsp;red = subtract &middot; gray = unused &middot; blue = add &middot;
 thicker = stronger</div>
@@ -231,12 +290,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('ckpt', nargs='+')
     ap.add_argument('-o', '--out', default='gates.html')
+    # off by default: at dense's 66 edges a topology drawing is unreadable clutter,
+    # so it is only worth rendering for a sparse variant you asked for it on.
+    ap.add_argument('--arch', choices=('none', 'linear', 'u'), default='none',
+                    help="draw the topology beside the heatmaps: 'u' folds it at "
+                         "the midpoint (U-Net), 'linear' keeps one column")
     a = ap.parse_args()
     panels = sorted((load(p) for p in a.ckpt), key=lambda x: x[1] or 0)
     n_layer = panels[0][0]['n_layer']
     vmax = max(abs(v) for _, _, m in panels for row in m for v in row if v is not None)
     with open(a.out, 'w') as f:
-        f.write(html(panels, vmax, n_layer))
+        f.write(html(panels, vmax, n_layer, a.arch))
     print(f'wrote {a.out}  (vmax={vmax:.4f}, {len(panels)} panel(s))\n')
     for p in glyph_panels(panels[-1][2], n_layer):
         print(p, '\n')
