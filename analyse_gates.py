@@ -201,9 +201,80 @@ def arch_svg_u(mat, it, n_layer, vmax):
             f'{"".join(p)}</figure>')
 
 
-def grid(panels, vmax, n_layer, signed, arch='none'):
+def arch_svg_inv_u(mat, it, n_layer, vmax, thresh=0.0):
+    """The sequence folded into an inverted U: B0 bottom-left, rising to B{h-1} at the
+    apex, then descending the right arm to the last block.
+
+    Works for any topology, not just the mirror one -- the fold is a layout choice, so
+    dense's arbitrary (i, j) edges are drawn as chords through the interior while
+    same-arm edges bulge outward. Flow runs *up* the left arm and *down* the right, so
+    every block's input wire is below it on the left and above it on the right.
+
+    thresh drops |g| <= thresh. The caption reports how many edges were hidden, since a
+    filtered figure that does not say so reads as if it showed everything.
+    """
+    h = (n_layer + 1) // 2
+    PITCH, TOP, BOX_W, BOX_H = 52, 58, 46, 22
+    gut = 20 + 12 * (h - 1)                    # room for the outside bulges
+    XL = gut + BOX_W / 2 + 4
+    XR = XL + 152
+    W, H = XR + gut + BOX_W / 2 + 4, TOP + PITCH * h + 74
+
+    def row(i):
+        return h - 1 - i if i < h else h - 1 - (n_layer - 1 - i)
+
+    def xb(i):
+        return XL if i < h else XR
+
+    def yb(i):
+        return TOP + PITCH * row(i)
+
+    def tap(j):                                # the wire entering block j
+        return (XL, yb(j) + BOX_H + 12) if j < h else (XR, yb(j) - 12)
+
+    shown = [(i, j, v) for i in range(n_layer) for j in range(n_layer)
+             if (v := mat[i][j]) is not None and abs(v) > thresh]
+    total = sum(1 for i in range(n_layer) for j in range(n_layer) if mat[i][j] is not None)
+
+    y_apex, y_in, y_out = TOP - 24, yb(0) + BOX_H + 26, yb(n_layer - 1) + BOX_H + 26
+    p = [f'<svg viewBox="0 0 {W:.0f} {H}" width="{W:.0f}" height="{H}" role="img" '
+         f'aria-label="topology folded into an inverted U, edges coloured by gate value">']
+    p.append(f'<path class="stream" fill="none" d="M {XL} {y_in} L {XL} {y_apex} '
+             f'L {XR} {y_apex} L {XR} {y_out}"/>')
+    p.append(f'<text x="{XL}" y="{y_in + 16}" class="lbl" text-anchor="middle">embed</text>')
+    p.append(f'<text x="{XR}" y="{y_out + 16}" class="lbl" text-anchor="middle">logits</text>')
+
+    for i, j, v in sorted(shown, key=lambda e: abs(e[2])):   # weakest first, strong on top
+        (x0, y0), (x1, y1) = tap(j), tap(i)
+        if x0 == x1:                           # same arm: bulge away from the interior
+            out = -1 if x0 == XL else 1
+            cx, cy = x0 + out * (20 + 12 * abs(row(i) - row(j))), (y0 + y1) / 2
+        else:                                  # cross-arm: a chord through the interior
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2 + 26
+        p.append(f'<path d="M {x0:.0f} {y0} Q {cx:.0f} {cy:.0f} {x1:.0f} {y1}" '
+                 f'stroke="{colour(v, vmax)}" stroke-width="{1 + 4 * abs(v) / vmax:.2f}" '
+                 f'fill="none"><title>B{i} &larr; t{j}: {v:+.4f}</title></path>')
+
+    for i in range(n_layer):
+        p.append(f'<rect x="{xb(i) - BOX_W / 2}" y="{yb(i)}" width="{BOX_W}" '
+                 f'height="{BOX_H}" rx="3" class="blk"/>')
+        p.append(f'<text x="{xb(i)}" y="{yb(i) + 15}" class="blbl" '
+                 f'text-anchor="middle">B{i}</text>')
+    p.append('</svg>')
+    hid = total - len(shown)
+    cap = f'topology &mdash; iter {it}'
+    if thresh:
+        cap += (f' &middot; {len(shown)} of {total} edges (|g| &gt; {thresh:g}; '
+                f'{hid} weaker edge{"s" if hid != 1 else ""} hidden)')
+    return f'<figure><figcaption>{cap}</figcaption>{"".join(p)}</figure>'
+
+
+def grid(panels, vmax, n_layer, signed, arch='none', thresh=0.0):
     draw = {'linear': arch_svg, 'u': arch_svg_u}.get(arch)
-    cells = [draw(m, it, n_layer, vmax) for _a, it, m in panels] if draw else []
+    if arch == 'invu':
+        cells = [arch_svg_inv_u(m, it, n_layer, vmax, thresh) for _a, it, m in panels]
+    else:
+        cells = [draw(m, it, n_layer, vmax) for _a, it, m in panels] if draw else []
     for _args, it, mat in panels:
         rows = []
         for i in range(1, n_layer):
@@ -228,7 +299,7 @@ def _rgb(hexstr):
     return tuple(int(hexstr[k:k + 2], 16) for k in (1, 3, 5))
 
 
-def html(panels, vmax, n_layer, arch):
+def html(panels, vmax, n_layer, arch, thresh):
     steps = [-vmax + 2 * vmax * k / 16 for k in range(17)]
     leg_signed = ''.join(f'<span style="background:{colour(v, vmax)}"></span>' for v in steps)
     leg_abs = ''.join(f'<span style="background:{colour(vmax * k / 16, vmax, False)}"></span>'
@@ -272,7 +343,7 @@ anything.</p>
 <h2>Signed &mdash; direction of the edge</h2>
 <p>Diverging scale, symmetric at &plusmn;{vmax:.2f}. Blue adds the earlier state,
 red subtracts it, gray is an unused edge.</p>
-{grid(panels, vmax, n_layer, True, arch)}
+{grid(panels, vmax, n_layer, True, arch, thresh)}
 <div class=legend>{-vmax:+.2f}<span class=bar>{leg_signed}</span>{vmax:+.2f}
 &nbsp;&nbsp;red = subtract &middot; gray = unused &middot; blue = add &middot;
 thicker = stronger</div>
@@ -292,15 +363,17 @@ def main():
     ap.add_argument('-o', '--out', default='gates.html')
     # off by default: at dense's 66 edges a topology drawing is unreadable clutter,
     # so it is only worth rendering for a sparse variant you asked for it on.
-    ap.add_argument('--arch', choices=('none', 'linear', 'u'), default='none',
+    ap.add_argument('--arch', choices=('none', 'linear', 'u', 'invu'), default='none',
                     help="draw the topology beside the heatmaps: 'u' folds it at "
-                         "the midpoint (U-Net), 'linear' keeps one column")
+                         "the midpoint (U), 'invu' folds it apex-up, 'linear' keeps one column")
+    ap.add_argument('--min-gate', type=float, default=0.0,
+                    help='drop edges with |g| <= this from the topology drawing')
     a = ap.parse_args()
     panels = sorted((load(p) for p in a.ckpt), key=lambda x: x[1] or 0)
     n_layer = panels[0][0]['n_layer']
     vmax = max(abs(v) for _, _, m in panels for row in m for v in row if v is not None)
     with open(a.out, 'w') as f:
-        f.write(html(panels, vmax, n_layer, a.arch))
+        f.write(html(panels, vmax, n_layer, a.arch, a.min_gate))
     print(f'wrote {a.out}  (vmax={vmax:.4f}, {len(panels)} panel(s))\n')
     for p in glyph_panels(panels[-1][2], n_layer):
         print(p, '\n')
