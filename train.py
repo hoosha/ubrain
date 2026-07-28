@@ -90,11 +90,27 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# Human-readable variant labels for run names, W&B and out_dir. "gated" vs "sum"/"mean"
+# is the distinction that matters once both learned and fixed coefficients exist, and
+# "-alpha" is legible where "-ls" was not.
+VARIANT_LABEL = {
+    'baseline': 'baseline',
+    'dense': 'dense-gated',
+    'unet': 'unet-gated',
+    'dense_ungated': 'dense-mean',
+    'unet_ungated': 'unet-sum',
+}
+
+def variant_label(residual, block_scale):
+    label = VARIANT_LABEL.get(residual, residual)
+    return label + ('-alpha' if block_scale == 'learned' else '')
+
+
 # various inits, derived attributes, I/O setup
 if device == 'auto':
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 if unique_out_dir:
-    tag = f"{arch}-{norm_placement}-{residual}{'-ls' if block_scale == 'learned' else ''}"
+    tag = f"{arch}-{norm_placement}-{variant_label(residual, block_scale)}"
     out_dir = os.path.join(out_dir, f"{tag}-L{n_layer}-s{seed}")
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -328,9 +344,8 @@ running_mfu = -1.0
 # without re-running anything. These can disagree: cross-depth skips add ~no
 # parameters but do keep early block outputs alive, which costs memory.
 run_cfg = raw_model.config # authoritative on resume; CLI globals may describe another model
-run_name = (f"{run_cfg.arch}-{run_cfg.norm_placement}-{run_cfg.residual}"
-            f"{'-ls' if run_cfg.block_scale == 'learned' else ''}"
-            f"-L{run_cfg.n_layer}-s{seed}")
+variant = variant_label(run_cfg.residual, run_cfg.block_scale)
+run_name = f"{run_cfg.arch}-{run_cfg.norm_placement}-{variant}-L{run_cfg.n_layer}-s{seed}"
 n_params = raw_model.get_num_params()
 total_params = raw_model.get_num_params(non_embedding=False)
 flops_per_token = raw_model.flops_per_token()
@@ -345,7 +360,8 @@ def peak_memory_bytes():
 def log_metrics(**kw):
     if not master_process:
         return
-    record = dict(run=run_name, arch=run_cfg.arch, norm_placement=run_cfg.norm_placement,
+    record = dict(run=run_name, variant=variant, arch=run_cfg.arch,
+                  norm_placement=run_cfg.norm_placement,
                   residual=run_cfg.residual, block_scale=run_cfg.block_scale,
                   n_layer=run_cfg.n_layer, n_embd=run_cfg.n_embd,
                   seed=seed, dataset=dataset,
@@ -367,9 +383,11 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=run_name, id=wandb_id, resume='allow',
                config={**config, 'device': device, 'dtype': dtype, 'out_dir': out_dir,
                        'params': n_params, 'total_params': total_params,
-                       'flops_per_token': flops_per_token},
+                       'flops_per_token': flops_per_token, 'variant': variant},
                group=wandb_group or None,
-               tags=['controlled-comparison', dataset, run_cfg.arch])
+               # tags so the UI can filter on either experimental axis directly
+               tags=['controlled-comparison', dataset, run_cfg.arch, f'variant:{variant}',
+                     f'skip:{run_cfg.residual}', f'alpha:{run_cfg.block_scale}'])
 
 eval_count = 0
 
