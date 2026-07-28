@@ -19,11 +19,14 @@ KAGGLE = (shutil.which('kaggle', path=os.path.dirname(sys.executable))
           or shutil.which('kaggle') or 'kaggle')
 
 KERNELS = {
-    'prep': dict(code='prep.py', gpu=False, sources=[], datasets=[]),
+    'prep': dict(code='prep.py', gpu=False, sources=[], datasets=[], accelerator=None),
     # Attach data and credentials as datasets, not UI state: secret attachments and
     # kernel-output sources are both dropped when a new kernel version is pushed,
     # whereas dataset_sources travel with this metadata.
-    'train': dict(code='train.py', gpu=True, sources=[],
+    # accelerator: Kaggle otherwise hands out either a T4 or a P100, and its PyTorch
+    # build has no sm_60 kernels, so a P100 fails immediately ("no kernel image is
+    # available"). Triton also needs sm_70+ for torch.compile.
+    'train': dict(code='train.py', gpu=True, sources=[], accelerator='NvidiaTeslaT4',
                   datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
 }
 
@@ -75,7 +78,11 @@ def main(which):
         with open(os.path.join(tmp, 'kernel-metadata.json'), 'w') as f:
             json.dump(meta, f, indent=2)
         print(json.dumps(meta, indent=2))
-        subprocess.run([KAGGLE, 'kernels', 'push', '-p', tmp], check=True)
+        cmd = [KAGGLE, 'kernels', 'push', '-p', tmp]
+        if spec.get('accelerator'):
+            cmd += ['--accelerator', spec['accelerator']]
+        print('$', ' '.join(cmd))
+        subprocess.run(cmd, check=True)
 
 
 if __name__ == '__main__':

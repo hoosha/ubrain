@@ -135,6 +135,18 @@ if device_type != 'cuda' and dtype != 'float32':
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if dtype == 'float32' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 print(f"resolved device={device} device_type={device_type} dtype={dtype}")
+if device_type == 'cuda':
+    cap = torch.cuda.get_device_capability()
+    print(f"gpu={torch.cuda.get_device_name(0)} capability=sm_{cap[0]}{cap[1]}")
+    supported = torch.cuda.get_arch_list()
+    if f'sm_{cap[0]}{cap[1]}' not in supported:
+        # e.g. a Kaggle P100 (sm_60) against a torch build shipping sm_70+ only. Without
+        # this the first compile dies in Inductor with "no kernel image is available".
+        raise SystemExit(f"this torch build has no kernels for sm_{cap[0]}{cap[1]} "
+                         f"(supports {supported}); request a newer GPU")
+    if compile and cap < (7, 0):
+        print('disabling torch.compile: Triton requires sm_70+')
+        compile = False
 
 # poor man's data loader. Independent generators keep training and both evaluation
 # streams identical across architectures, regardless of model-init RNG consumption.
