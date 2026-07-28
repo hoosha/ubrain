@@ -269,10 +269,113 @@ def arch_svg_inv_u(mat, it, n_layer, vmax, thresh=0.0):
     return f'<figure><figcaption>{cap}</figcaption>{"".join(p)}</figure>'
 
 
-def grid(panels, vmax, n_layer, signed, arch='none', thresh=0.0):
+def arch_svg_towers(mat, it, n_layer, vmax, thresh=0.0, mirror_only=False, name=''):
+    """Two towers with B{h-1} bridging at the top: the first arm rises, the bridge block
+    crosses, the second descends.
+
+    The point of this layout is that a mirror edge (i + j == n_layer - 1) lands with its
+    source tap and its destination on the *same row*, so it draws as a horizontal
+    crossbar. That makes two different topologies directly comparable edge-for-edge on
+    one scale -- which the arch and matrix views do not.
+
+    Non-mirror edges have no horizontal home here and are drawn as curves, or dropped
+    entirely under mirror_only. Reads best at even depth; at odd depth the bridge
+    consumes a tap that has no partner on the far tower.
+    """
+    h = (n_layer + 1) // 2
+    nrow = n_layer - h                         # tap rows == blocks on the second tower
+    PITCH, TOP, BOX_W, BOX_H = 54, 104, 46, 22
+    XL, XR = 62, 258
+    W, H = XR + 78, TOP + PITCH * nrow + 64
+
+    def y_row(r):
+        return TOP + PITCH * r
+
+    def tap(j):                                # the wire entering block j
+        return ((XL, y_row(n_layer - 1 - j - h)) if j <= n_layer - 1 - h
+                else (XR, y_row(j - h)))
+
+    inject = tap                               # a skip lands on its destination's input wire
+    y_top, y_bot = y_row(0), y_row(nrow - 1)
+    y_bridge = TOP - 62
+    XM = (XL + XR) / 2
+
+    p = [f'<svg viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
+         f'aria-label="two towers bridged at the top, crossbars coloured by gate value">']
+    # left tower rises, bridge crosses the top, right tower descends
+    p.append(f'<path class="stream" fill="none" d="M {XL} {y_bot + 40} L {XL} {y_bridge} '
+             f'L {XM - 34} {y_bridge}"/>')
+    p.append(f'<path class="stream" fill="none" d="M {XM + 34} {y_bridge} L {XR} {y_bridge} '
+             f'L {XR} {y_bot + 40}"/>')
+    p.append(f'<rect x="{XM - 34}" y="{y_bridge - BOX_H / 2}" width="68" height="{BOX_H}" '
+             f'rx="3" class="blk"/>')
+    p.append(f'<text x="{XM}" y="{y_bridge + 4}" class="blbl" text-anchor="middle">'
+             f'B{h - 1}</text>')
+    p.append(f'<text x="{XL}" y="{y_bot + 56}" class="lbl" text-anchor="middle">embed</text>')
+    p.append(f'<text x="{XR}" y="{y_bot + 56}" class="lbl" text-anchor="middle">logits</text>')
+
+    mirror = [(i, n_layer - 1 - i) for i in range(h, n_layer)]
+    drawn = 0
+    total = sum(1 for i in range(n_layer) for j in range(n_layer) if mat[i][j] is not None)
+    for i, j in mirror:                        # horizontal crossbars, the comparable set
+        v = mat[i][j]
+        if v is None or abs(v) <= thresh:
+            continue
+        y = y_row(i - h)
+        p.append(f'<line x1="{XL}" y1="{y}" x2="{XR - 8}" y2="{y}" '
+                 f'stroke="{colour(v, vmax)}" stroke-width="{1 + 4 * abs(v) / vmax:.2f}">'
+                 f'<title>B{i} &larr; t{j}: {v:+.4f}</title></line>')
+        p.append(f'<text x="{XM}" y="{y - 6}" class="lbl" text-anchor="middle">{v:+.2f}</text>')
+        drawn += 1
+    if not mirror_only:
+        for i in range(n_layer):
+            for j in range(n_layer):
+                v = mat[i][j]
+                if v is None or abs(v) <= thresh or (i, j) in mirror:
+                    continue
+                (x0, y0), (x1, y1) = tap(j), inject(i)
+                cx = (x0 + x1) / 2 + (0 if x0 != x1 else (-40 if x0 == XL else 40))
+                p.append(f'<path d="M {x0:.0f} {y0} Q {cx:.0f} {(y0 + y1) / 2 + 18:.0f} '
+                         f'{x1:.0f} {y1}" stroke="{colour(v, vmax)}" fill="none" '
+                         f'stroke-width="{1 + 4 * abs(v) / vmax:.2f}" stroke-dasharray="3 3">'
+                         f'<title>B{i} &larr; t{j}: {v:+.4f}</title></path>')
+                drawn += 1
+
+    for i in list(range(h - 1)) + list(range(h, n_layer)):
+        if i < h:                              # left tower: sits between its two taps
+            x, y = XL, tap(i)[1] - PITCH / 2 - BOX_H / 2
+        else:
+            x, y = XR, y_row(i - h) + 14
+        p.append(f'<rect x="{x - BOX_W / 2}" y="{y:.0f}" width="{BOX_W}" height="{BOX_H}" '
+                 f'rx="3" class="blk"/>')
+        p.append(f'<text x="{x}" y="{y + 15:.0f}" class="blbl" text-anchor="middle">B{i}</text>')
+    p.append('</svg>')
+
+    cap = f'{name} &mdash; iter {it}' if name else f'topology &mdash; iter {it}'
+    note = 'mirror edges only' if mirror_only else 'dashed = non-mirror'
+    # state the scale here: this view rescales to its own edges, so the section legend
+    # below (which covers the heatmaps) does not describe these colours
+    cap += f' &middot; {drawn} of {total} edges ({note}) &middot; scale &plusmn;{vmax:.2f}'
+    return f'<figure><figcaption>{cap}</figcaption>{"".join(p)}</figure>'
+
+
+def grid(panels, vmax, n_layer, signed, arch='none', thresh=0.0, mirror_only=False):
     draw = {'linear': arch_svg, 'u': arch_svg_u}.get(arch)
     if arch == 'invu':
         cells = [arch_svg_inv_u(m, it, n_layer, vmax, thresh) for _a, it, m in panels]
+    elif arch == 'towers':
+        # Scale to the edges actually drawn, shared across panels. Keeping the document
+        # vmax would set the range from an edge this view hides, washing every crossbar
+        # out; the section text states the scale so it is not mistaken for the heatmap's.
+        mir = [(i, n_layer - 1 - i) for i in range((n_layer + 1) // 2, n_layer)]
+        cand = [abs(m[i][j]) for _a, _it, m in panels for i, j in mir
+                if m[i][j] is not None and abs(m[i][j]) > thresh]
+        if not mirror_only:
+            cand += [abs(v) for _a, _it, m in panels for r in m for v in r
+                     if v is not None and abs(v) > thresh]
+        tvmax = max(cand) if cand else vmax
+        cells = [arch_svg_towers(m, it, n_layer, tvmax, thresh, mirror_only,
+                                 a.get('residual', '')) for a, it, m in panels]
     else:
         cells = [draw(m, it, n_layer, vmax) for _a, it, m in panels] if draw else []
     for _args, it, mat in panels:
@@ -290,7 +393,9 @@ def grid(panels, vmax, n_layer, signed, arch='none', thresh=0.0):
                            f'title="B{i} &larr; t{j}: {v:+.4f}">{txt}</td>')
             rows.append(f'<tr><th>B{i}</th>{"".join(tds)}</tr>')
         head = ''.join(f'<th>t{j}</th>' for j in range(n_layer - 1))
-        cells.append(f'<figure><figcaption>iter {it}</figcaption>'
+        who = _args.get('residual', '')
+        cells.append(f'<figure><figcaption>{who + " &mdash; " if who else ""}iter {it}'
+                     f'</figcaption>'
                      f'<table><tr><th></th>{head}</tr>{"".join(rows)}</table></figure>')
     return f'<div class=grid>{"".join(cells)}</div>'
 
@@ -299,7 +404,7 @@ def _rgb(hexstr):
     return tuple(int(hexstr[k:k + 2], 16) for k in (1, 3, 5))
 
 
-def html(panels, vmax, n_layer, arch, thresh):
+def html(panels, vmax, n_layer, arch, thresh, mirror_only):
     steps = [-vmax + 2 * vmax * k / 16 for k in range(17)]
     leg_signed = ''.join(f'<span style="background:{colour(v, vmax)}"></span>' for v in steps)
     leg_abs = ''.join(f'<span style="background:{colour(vmax * k / 16, vmax, False)}"></span>'
@@ -343,7 +448,7 @@ anything.</p>
 <h2>Signed &mdash; direction of the edge</h2>
 <p>Diverging scale, symmetric at &plusmn;{vmax:.2f}. Blue adds the earlier state,
 red subtracts it, gray is an unused edge.</p>
-{grid(panels, vmax, n_layer, True, arch, thresh)}
+{grid(panels, vmax, n_layer, True, arch, thresh, mirror_only)}
 <div class=legend>{-vmax:+.2f}<span class=bar>{leg_signed}</span>{vmax:+.2f}
 &nbsp;&nbsp;red = subtract &middot; gray = unused &middot; blue = add &middot;
 thicker = stronger</div>
@@ -363,17 +468,22 @@ def main():
     ap.add_argument('-o', '--out', default='gates.html')
     # off by default: at dense's 66 edges a topology drawing is unreadable clutter,
     # so it is only worth rendering for a sparse variant you asked for it on.
-    ap.add_argument('--arch', choices=('none', 'linear', 'u', 'invu'), default='none',
+    ap.add_argument('--arch', choices=('none', 'linear', 'u', 'invu', 'towers'), default='none',
                     help="draw the topology beside the heatmaps: 'u' folds it at "
-                         "the midpoint (U), 'invu' folds it apex-up, 'linear' keeps one column")
+                         "the midpoint (U), 'invu' apex-up, 'towers' two towers bridged at "
+                         "the top, 'linear' one column")
     ap.add_argument('--min-gate', type=float, default=0.0,
                     help='drop edges with |g| <= this from the topology drawing')
+    ap.add_argument('--mirror-only', action='store_true',
+                    help='towers layout: draw only i+j==n_layer-1 edges, the set two '
+                         'topologies share, so different variants compare edge-for-edge')
     a = ap.parse_args()
-    panels = sorted((load(p) for p in a.ckpt), key=lambda x: x[1] or 0)
+    panels = sorted((load(p) for p in a.ckpt),
+                key=lambda x: (x[1] or 0, x[0].get('residual', '')))
     n_layer = panels[0][0]['n_layer']
     vmax = max(abs(v) for _, _, m in panels for row in m for v in row if v is not None)
     with open(a.out, 'w') as f:
-        f.write(html(panels, vmax, n_layer, a.arch, a.min_gate))
+        f.write(html(panels, vmax, n_layer, a.arch, a.min_gate, a.mirror_only))
     print(f'wrote {a.out}  (vmax={vmax:.4f}, {len(panels)} panel(s))\n')
     for p in glyph_panels(panels[-1][2], n_layer):
         print(p, '\n')
