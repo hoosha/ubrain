@@ -34,11 +34,34 @@ SWEEPS = {
         dict(residual='baseline', block_scale='learned', warmup_iters=0, run_suffix='nowarm'),
         dict(residual='unet_ungated', block_scale='learned', warmup_iters=0, run_suffix='nowarm'),
     ),
+    # Every earlier sweep annealed 6e-4 -> 6e-5 over the run, so a late-schedule drop
+    # (~0.09 in the last 400 iters) sat on top of every variant difference. Hold LR flat
+    # at 6e-4 instead: loss at any step then reflects optimisation progress rather than
+    # schedule position, and no variant can win by interacting with the anneal. Split
+    # across two kernels so six ~2h runs finish in ~6h wall-clock, not 12h.
+    'flat_a': (
+        dict(residual='baseline', run_suffix='flat'),
+        dict(residual='dense', run_suffix='flat'),
+        dict(residual='unet', run_suffix='flat'),
+    ),
+    'flat_b': (
+        dict(residual='unet_ungated', run_suffix='flat'),
+        # zero-init block scales are the case ReZero says needs no warmup
+        dict(residual='baseline', block_scale='learned', warmup_iters=0,
+             run_suffix='flat-nowarm'),
+        dict(residual='unet_ungated', block_scale='learned', warmup_iters=0,
+             run_suffix='flat-nowarm'),
+    ),
 }
+# per-sweep overrides layered between BASE and each run's own spec
+SWEEP_BASE = {'flat_a': dict(lr_schedule='constant'), 'flat_b': dict(lr_schedule='constant')}
+# sweeps that share a W&B group, so runs split across kernels still compare in one place
+SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat'}
 ACTIVE = 'alive'  # push.py rewrites this line
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')
-GROUP = os.environ.get('WANDB_GROUP', f'finewebedu-{ACTIVE}-s{SEED}')
+GROUP = os.environ.get('WANDB_GROUP',
+                       f'finewebedu-{SWEEP_GROUP.get(ACTIVE, ACTIVE)}-s{SEED}')
 
 subprocess.run(['git', 'clone', '--depth', '1', '-b', 'main', REPO, CLONE], check=True)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'tiktoken', 'wandb'], check=True)
@@ -49,10 +72,14 @@ def wandb_key():
     if os.environ.get('WANDB_API_KEY'):
         return os.environ['WANDB_API_KEY'], 'env'
     # A private dataset in dataset_sources survives `kernels push`, unlike a UI secret.
-    for path in ('/kaggle/input/wandb-key/wandb_key.txt', '/kaggle/input/wandb-key/wandb_key'):
-        if os.path.exists(path):
-            with open(path) as f:
-                return f.read().strip(), 'dataset'
+    # Walk rather than hardcode: the mount is /kaggle/input/datasets/<user>/<slug>/ in
+    # some sessions and /kaggle/input/<slug>/ in others, and a wrong guess here costs
+    # the whole run's dashboards.
+    for root, _dirs, files in os.walk('/kaggle/input'):
+        for name in files:
+            if name in ('wandb_key.txt', 'wandb_key'):
+                with open(os.path.join(root, name)) as f:
+                    return f.read().strip(), f'dataset:{os.path.join(root, name)}'
     try:
         from kaggle_secrets import UserSecretsClient  # available only on Kaggle
         return UserSecretsClient().get_secret('WANDB_API_KEY'), 'secret'
@@ -101,7 +128,7 @@ BASE = dict(device='cuda', seed=SEED, max_iters=MAX_ITERS, lr_decay_iters=MAX_IT
 
 failures = []
 for spec in SWEEPS[ACTIVE]:
-    args = {**BASE, **spec}   # per-run overrides win over the shared defaults
+    args = {**BASE, **SWEEP_BASE.get(ACTIVE, {}), **spec}  # narrowest wins
     label = '/'.join(f'{k}={v}' for k, v in spec.items())
     print(f'=== {label} ===', flush=True)
     result = subprocess.run(

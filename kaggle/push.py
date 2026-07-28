@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+BRANCH = 'main'  # the branch kaggle/train.py clones; keep the two in step
 # Prefer the CLI installed alongside this interpreter (e.g. inside a venv) over PATH.
 KAGGLE = (shutil.which('kaggle', path=os.path.dirname(sys.executable))
           or shutil.which('kaggle') or 'kaggle')
@@ -34,6 +35,12 @@ KERNELS = {
     'train-nowarmup': dict(code='train.py', gpu=True, sources=[], sweep='nowarmup',
                            accelerator='NvidiaTeslaT4',
                            datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
+    'train-flat-a': dict(code='train.py', gpu=True, sources=[], sweep='flat_a',
+                         accelerator='NvidiaTeslaT4',
+                         datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
+    'train-flat-b': dict(code='train.py', gpu=True, sources=[], sweep='flat_b',
+                         accelerator='NvidiaTeslaT4',
+                         datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
 }
 
 
@@ -53,6 +60,28 @@ def username():
         'could not determine Kaggle username. Run `kaggle auth login`, or set KAGGLE_USERNAME.')
 
 
+def assert_remote_has_head():
+    """The kernel clones `main` from GitHub, so pushing a kernel while local commits have
+    not reached origin/main trains *stale code* -- and the failure surfaces hours later as
+    an unknown-config-key crash, or worse, silently as a run of the previous config. This
+    has bitten twice; check it instead of remembering it."""
+    def git(*a):
+        return subprocess.run(['git', *a], capture_output=True, text=True).stdout.strip()
+    subprocess.run(['git', 'fetch', '-q', 'origin', BRANCH], check=False)
+    head, remote = git('rev-parse', 'HEAD'), git('rev-parse', f'origin/{BRANCH}')
+    if not remote:
+        raise SystemExit(f'cannot resolve origin/{BRANCH}')
+    if head != remote and subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', head, remote]).returncode != 0:
+        raise SystemExit(
+            f'origin/{BRANCH} is at {remote[:7]} and does not contain HEAD ({head[:7]}).\n'
+            f'The kernel clones {BRANCH}, so it would train stale code.\n'
+            f'Fix:  git branch -f {BRANCH} HEAD && git push origin {BRANCH}')
+    dirty = git('status', '--porcelain')
+    if dirty:
+        print(f'WARNING: uncommitted changes will NOT reach the kernel:\n{dirty}')
+
+
 def dataset_exists(ref):
     r = subprocess.run([KAGGLE, 'datasets', 'files', ref], capture_output=True, text=True)
     return r.returncode == 0
@@ -60,6 +89,8 @@ def dataset_exists(ref):
 
 def main(which):
     spec = KERNELS[which]
+    if spec['gpu']:
+        assert_remote_has_head()
     user = username()
     with tempfile.TemporaryDirectory() as tmp:
         # kaggle kernels push requires the code file and metadata in one directory

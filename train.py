@@ -77,6 +77,10 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
+# 'cosine': warmup then cosine to min_lr. 'constant': warmup then hold learning_rate,
+# so a variant comparison is not confounded by where each run sits in an anneal -- the
+# late-schedule drop is large enough to mask or invent differences between variants.
+lr_schedule = 'cosine' # 'cosine' | 'constant'
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
@@ -320,7 +324,10 @@ def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
+    # 2) constant schedule: hold the peak LR after warmup
+    if lr_schedule == 'constant':
+        return learning_rate
+    # 3) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
