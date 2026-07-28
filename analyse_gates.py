@@ -94,8 +94,57 @@ def glyph_panels(mat, n_layer):
     return out
 
 
-def grid(panels, vmax, n_layer, signed):
-    cells = []
+def arch_svg(mat, it, n_layer, vmax):
+    """The network itself, with each skip drawn as an arc coloured by its gate value.
+
+    Both endpoints sit on the residual stream and the arc bulges left in proportion
+    to the span, so U-Net's mirror pattern shows up as nested arches. Colour is the
+    same diverging scale as the heatmap; stroke width redundantly encodes |g| so the
+    strong edges are legible without relying on colour alone.
+    """
+    PITCH, TOP, BOX_W, BOX_H = 34, 46, 46, 20
+    gutter = 24 + 14 * (n_layer - 1)  # must clear the widest arc: bulge at max span
+    x = gutter + BOX_W / 2 + 4        # residual stream, with the arc gutter to its left
+    W = x + 62                        # room for the centred bottom label
+    H = TOP + PITCH * n_layer + 54
+
+    def y_block(i):
+        return TOP + PITCH * i
+
+    def y_tap(i):                     # the wire entering block i
+        return y_block(i) - 12
+
+    parts = [f'<svg viewBox="0 0 {W:.0f} {H}" width="{W:.0f}" height="{H}" '
+             f'role="img" aria-label="skip topology, arcs coloured by gate value">']
+    parts.append(f'<line x1="{x}" y1="{TOP - 26}" x2="{x}" y2="{y_block(n_layer) + 14}" '
+                 f'class="stream"/>')
+    parts.append(f'<text x="{x}" y="{TOP - 30}" class="lbl" text-anchor="middle">embed</text>')
+    parts.append(f'<text x="{x}" y="{y_block(n_layer) + 28}" class="lbl" '
+                 f'text-anchor="middle">norm &rarr; logits</text>')
+
+    # weakest first so the strong edges land on top rather than behind the clutter
+    edges = [(i, j, v) for i in range(n_layer) for j in range(n_layer)
+             if (v := mat[i][j]) is not None]
+    for i, j, v in sorted(edges, key=lambda e: abs(e[2])):
+        y0, y1 = y_tap(j), y_tap(i)
+        bulge = 18 + 14 * abs(i - j)
+        parts.append(
+            f'<path d="M {x} {y0} Q {x - bulge} {(y0 + y1) / 2:.0f} {x} {y1}" '
+            f'stroke="{colour(v, vmax)}" stroke-width="{1 + 4 * abs(v) / vmax:.2f}" '
+            f'fill="none"><title>B{i} &larr; t{j}: {v:+.4f}</title></path>')
+
+    for i in range(n_layer):
+        parts.append(f'<rect x="{x - BOX_W / 2}" y="{y_block(i)}" width="{BOX_W}" '
+                     f'height="{BOX_H}" rx="3" class="blk"/>')
+        parts.append(f'<text x="{x}" y="{y_block(i) + 14}" class="blbl" '
+                     f'text-anchor="middle">B{i}</text>')
+    parts.append('</svg>')
+    return (f'<figure><figcaption>topology &mdash; iter {it}</figcaption>'
+            f'{"".join(parts)}</figure>')
+
+
+def grid(panels, vmax, n_layer, signed, arch=False):
+    cells = [arch_svg(m, it, n_layer, vmax) for _a, it, m in panels] if arch else []
     for _args, it, mat in panels:
         rows = []
         for i in range(1, n_layer):
@@ -128,9 +177,9 @@ def html(panels, vmax, n_layer):
     return f"""<!doctype html><meta charset=utf-8>
 <title>skip-gate values</title>
 <style>
- :root {{ --surface:#fcfcfb; --ink:#0b0b0b; --muted:#898781; --line:#e1e0d9; }}
+ :root {{ --surface:#fcfcfb; --ink:#0b0b0b; --muted:#898781; --line:#e1e0d9; --baseline:#c3c2b7; }}
  @media (prefers-color-scheme:dark) {{
-   :root {{ --surface:#1a1a19; --ink:#fff; --muted:#898781; --line:#2c2c2a; }} }}
+   :root {{ --surface:#1a1a19; --ink:#fff; --muted:#898781; --line:#2c2c2a; --baseline:#383835; }} }}
  body {{ background:var(--surface); color:var(--ink); margin:32px;
         font:13px/1.5 ui-sans-serif,system-ui,sans-serif; }}
  h1 {{ font-size:16px; font-weight:600; margin:0 0 4px; }}
@@ -149,6 +198,11 @@ def html(panels, vmax, n_layer):
             color:var(--muted); }}
  .legend span {{ width:16px; height:12px; display:inline-block; }}
  .legend .bar {{ display:flex; }}
+ .stream {{ stroke:var(--line); stroke-width:2; }}
+ .blk {{ fill:var(--surface); stroke:var(--baseline); stroke-width:1; }}
+ .lbl {{ fill:var(--muted); font-size:10px; }}
+ .blbl {{ fill:var(--ink); font-size:10px; }}
+ svg {{ overflow:visible; }}
 </style>
 <h1>Learned skip-gate values &mdash; row = destination block, column = source tap</h1>
 <p class=sub>t0 is the embedding output; t<sub>j</sub> is the output of block
@@ -159,9 +213,10 @@ anything.</p>
 <h2>Signed &mdash; direction of the edge</h2>
 <p>Diverging scale, symmetric at &plusmn;{vmax:.2f}. Blue adds the earlier state,
 red subtracts it, gray is an unused edge.</p>
-{grid(panels, vmax, n_layer, True)}
+{grid(panels, vmax, n_layer, True, arch=True)}
 <div class=legend>{-vmax:+.2f}<span class=bar>{leg_signed}</span>{vmax:+.2f}
-&nbsp;&nbsp;red = subtract &middot; gray = unused &middot; blue = add</div>
+&nbsp;&nbsp;red = subtract &middot; gray = unused &middot; blue = add &middot;
+thicker = stronger</div>
 
 <h2>Absolute value &mdash; strength of the edge</h2>
 <p>Sequential scale, one hue light&rarr;dark, 0 to {vmax:.2f}. Ignores direction so
