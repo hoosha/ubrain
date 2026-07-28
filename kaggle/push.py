@@ -20,10 +20,11 @@ KAGGLE = (shutil.which('kaggle', path=os.path.dirname(sys.executable))
 
 KERNELS = {
     'prep': dict(code='prep.py', gpu=False, sources=[], datasets=[]),
-    # The wandb-key dataset is optional but recommended: UI secret attachments are
-    # dropped whenever a new kernel version is pushed, dataset_sources are not.
-    'train': dict(code='train.py', gpu=True, sources=['{user}/ubrain-prep'],
-                  datasets=['{user}/wandb-key']),
+    # Attach data and credentials as datasets, not UI state: secret attachments and
+    # kernel-output sources are both dropped when a new kernel version is pushed,
+    # whereas dataset_sources travel with this metadata.
+    'train': dict(code='train.py', gpu=True, sources=[],
+                  datasets=['{user}/ubrain-finewebedu', '{user}/wandb-key']),
 }
 
 

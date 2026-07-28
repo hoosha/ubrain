@@ -14,7 +14,6 @@ import sys
 
 REPO = 'https://github.com/hoosha/ubrain.git'
 CLONE = '/tmp/ubrain'
-DATA_IN = '/kaggle/input/ubrain-prep'
 VARIANTS = ('baseline', 'dense', 'unet')
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')
@@ -51,13 +50,30 @@ else:
     os.environ['WANDB_MODE'] = 'offline'
     print('WARNING: running with WANDB_MODE=offline; metrics will need syncing', flush=True)
 
+def find_tokens():
+    """Locate train.bin/val.bin under /kaggle/input.
+
+    The mount name depends on whether the tokens arrive as a dataset or as another
+    kernel's output, and UI-side attachments are not preserved across API pushes, so
+    search rather than hard-coding one path.
+    """
+    for root, _dirs, files in os.walk('/kaggle/input'):
+        if 'train.bin' in files and 'val.bin' in files:
+            return root
+    tree = [os.path.join(r, f) for r, _d, fs in os.walk('/kaggle/input') for f in fs][:40]
+    raise SystemExit('could not find train.bin/val.bin under /kaggle/input. Contents:\n  '
+                     + ('\n  '.join(tree) or '(empty - no data source attached)'))
+
+
+DATA_IN = find_tokens()
+print('tokens from', DATA_IN, flush=True)
 data_dir = os.path.join(CLONE, 'data/finewebedu')
 os.makedirs(data_dir, exist_ok=True)
 for name in ('train.bin', 'val.bin'):
     src, dst = os.path.join(DATA_IN, name), os.path.join(data_dir, name)
     if not os.path.exists(dst):
         os.symlink(src, dst)
-    print(name, os.path.getsize(src), 'bytes')
+    print(name, os.path.getsize(src), 'bytes', flush=True)
 
 failures = []
 for residual in VARIANTS:
