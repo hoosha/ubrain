@@ -43,6 +43,10 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
+# Pin the entity. It is otherwise whatever the logged-in account's default happens to be,
+# so a fresh `wandb login` on another machine can silently file runs under a different
+# entity -- same project name, separate history, nothing comparable to what came before.
+wandb_entity = ''  # '' = use the account default
 wandb_run_name = 'gpt2' # retained for upstream config compatibility
 wandb_group = '' # optional comparison group
 wandb_artifact_every_evals = 0 # upload ckpt.pt as a W&B artifact every N evals (0 = only at the end)
@@ -399,7 +403,8 @@ if wandb_log and master_process:
     wandb_id = open(wandb_id_path).read().strip() if os.path.exists(wandb_id_path) else wandb.util.generate_id()
     with open(wandb_id_path, 'w') as f:
         f.write(wandb_id)
-    wandb.init(project=wandb_project, name=run_name, id=wandb_id, resume='allow',
+    wandb.init(project=wandb_project, entity=wandb_entity or None,
+               name=run_name, id=wandb_id, resume='allow',
                config={**config, 'device': device, 'dtype': dtype, 'out_dir': out_dir,
                        'params': n_params, 'total_params': total_params,
                        'flops_per_token': flops_per_token, 'variant': variant},

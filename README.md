@@ -58,14 +58,40 @@ python train.py config/train_shakespeare_char.py \
 
 `--device=auto` selects CUDA, then MPS, then CPU.
 
+## Results
+
+See **[RESULTS.md](RESULTS.md)**. The short version: run-to-run seed spread is ~0.022 val
+loss, which is as large as every architectural effect measured so far, so no comparison here
+is yet established. Compare variants on estimated FLOPs, not steps or wall-clock.
+
+## Multi-GPU
+
+`bash setup_gpu.sh` sets up a fresh host, runs both test suites, prepares data, and prints
+launch commands. `python test_ddp.py` (or under `torchrun`) checks every residual variant
+against DDP's reducer.
+
+Keep tokens/iter at 122,880 or nothing is comparable to existing runs. That is
+`gradient_accumulation_steps * batch_size * block_size`, independent of GPU count — but DDP
+needs the accumulation steps divisible by the GPU count:
+
+| accum | batch | valid GPU counts |
+|---|---|---|
+| 15 | 8 | 1, 3, 5 (the single-GPU setting used so far) |
+| 24 | 5 | 1, 2, 3, 4, 6, 8 — **use this for DDP** |
+| 8 | 15 | 1, 2, 4, 8 (needs ~40GB/GPU) |
+
+DDP resume is not supported; finish a run in one session.
+
 ## FineWeb-Edu experiments
 
 The experiment config uses a pinned FineWeb-Edu revision, GPT-2 BPE tokens, 12 transformer layers, no dropout, unique output directories, and W&B logging.
 
-Prepare 500M training tokens and 5M validation tokens:
+Prepare the dataset. **Use 260M tokens to reproduce the existing runs** — the stream is
+deterministic at a pinned revision, so the same `TARGET_TOKENS`/`VAL_TOKENS` gives
+byte-identical files and directly comparable val losses:
 
 ```bash
-python data/finewebedu/prepare.py
+TARGET_TOKENS=260000000 python data/finewebedu/prepare.py   # 260M train + 5M val, ~30 min
 ```
 
 Override the dataset size for a smoke test:
