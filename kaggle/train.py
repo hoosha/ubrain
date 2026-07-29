@@ -67,11 +67,20 @@ SWEEPS = {
         dict(residual='baseline', seed=1338, run_suffix='flat'),
         dict(residual='dense', seed=1338, run_suffix='flat'),
     ),
+    # Compute-matched endpoint, not an interpolated one. L6 costs 207.9M FLOPs/token vs
+    # L12's 300.1M (only 31% less -- the tied embedding/lm_head is depth-independent), so
+    # 2887 iters spends exactly what L12 spent in 2000. That makes "does shallow still win
+    # given the SAME total compute" a direct read rather than a curve interpolation.
+    # Note 2887 iters = 354.8M tokens = 1.36 epochs, so unlike every run so far this one
+    # revisits data; coverage is Poisson with lambda=1.36, ~74% of tokens seen at least once.
+    'l6_matched': (
+        dict(residual='dense', n_layer=6, max_iters=2887, run_suffix='flat-fmatch'),
+    ),
 }
 # per-sweep overrides layered between BASE and each run's own spec
-SWEEP_BASE = {k: dict(lr_schedule='constant') for k in ('flat_a', 'flat_b', 'shallow', 'seed1338')}
+SWEEP_BASE = {k: dict(lr_schedule='constant') for k in ('flat_a', 'flat_b', 'shallow', 'seed1338', 'l6_matched')}
 # sweeps that share a W&B group, so runs split across kernels still compare in one place
-SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat', 'shallow': 'flat', 'seed1338': 'flat-s1338'}
+SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat', 'shallow': 'flat', 'seed1338': 'flat-s1338', 'l6_matched': 'flat'}
 ACTIVE = 'alive'  # push.py rewrites this line
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')
