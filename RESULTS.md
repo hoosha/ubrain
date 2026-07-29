@@ -4,24 +4,28 @@ All numbers: FineWeb-Edu, GPT-2 BPE, `arch=modern` (RMSNorm + RoPE + SwiGLU + QK
 bias-free, pre-LN), 122,880 tokens/iter, 2,000 iters, single Kaggle T4 unless stated.
 W&B: `hooshaya-ucl/residual-rewiring`.
 
-## Read this first: seed noise is 0.022
+## Read this first: run-to-run noise is 0.022, but the paired delta survives it
 
-Two runs of the **identical** config (L12 baseline, flat LR, 2,000 iters):
+Two runs of the **identical** config (L12 baseline, flat LR, 2,000 iters) differ by more
+than any architectural effect measured here:
 
-| seed | val loss |
-|---|---|
-| 1337 | 3.9191 |
-| 1338 | 3.8968 |
-| **spread** | **0.0223** |
+| seed | baseline | dense-gated | paired delta |
+|---|---|---|---|
+| 1337 | 3.9191 | 3.8943 | **-0.0248** |
+| 1338 | 3.8968 | 3.8581 | **-0.0387** |
+| spread | 0.0223 | 0.0362 | |
 
-Every architectural effect measured below is **≤ that spread**. Nothing here is
-established. A new experiment targeting a ~0.02 effect with one run per arm cannot
-resolve anything — it will produce a number that reads like a result.
+So **absolute** losses are not comparable across seeds, and any single-seed *ranking* of
+variants whose deltas are under ~0.02 is meaningless. But the comparison is **paired** --
+same seed, same init, identical eval batches, and zero-init gates make step 0 bit-identical
+-- and the paired delta keeps its sign across both seeds while varying in magnitude
+(-0.025, -0.039). Dense also replicated across two LR schedules (-0.0266 cosine,
+-0.0248 flat).
 
-The comparisons *are* paired (same seed, same init, identical eval batches, and zero-init
-gates make step 0 identical), so a paired delta may be far more reproducible than 0.022
-suggests. That is untested: the run that would have shown it was cancelled. **The cheapest
-decisive experiment is `dense` at seed 1338**, since the seed-1338 baseline already exists.
+That makes dense-at-L12 the one effect with real support: 2/2 seeds, 2/2 schedules. It is
+still n=2 seeds, so treat the magnitude (~-0.03) as uncertain, and note that none of the
+*other* variants have been seed-replicated at all -- their deltas (-0.012 to +0.016) sit
+inside run-to-run noise and should not be ranked.
 
 ## Constant-LR sweep
 
@@ -96,8 +100,9 @@ Caveat: gate *magnitude* is not *contribution*. The honest quantity is
 
 ## Open next steps
 
-1. `dense` at seed 1338 — one run, gives the paired delta at a second seed.
-2. 3 seeds × {baseline, dense} for error bars on the one candidate effect.
+1. A third seed of {baseline, dense} to put an error bar on the ~-0.03 paired delta.
+2. Seed-replicate the variants that have never been repeated (unet-sum, baseline+alpha) --
+   or drop them, since their single-seed deltas are inside noise either way.
 3. Sparse topologies the gate matrix actually pointed at: embedding-tap-only (11 edges,
    ~1% overhead vs dense's 4.7%) and one-step-back-only.
 4. Richer gate forms — per-channel (25k params, ~0 extra FLOPs) or skips as extra block
