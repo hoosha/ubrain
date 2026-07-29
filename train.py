@@ -125,13 +125,21 @@ if ddp:
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
+    # CUDA only when there is CUDA: this lets the whole DDP path be exercised on CPU with
+    # the gloo backend, which is the only way to test it without a multi-GPU host.
+    if torch.cuda.is_available():
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
+    assert gradient_accumulation_steps % ddp_world_size == 0, (
+        f'gradient_accumulation_steps={gradient_accumulation_steps} is not divisible by '
+        f'world_size={ddp_world_size}. tokens/iter is accum*batch*block regardless of '
+        f'world size, so pick an accum that divides your GPU count and keep '
+        f'accum*batch_size fixed to hold tokens/iter comparable (e.g. 24x5 = 120 works '
+        f'for 1,2,3,4,6,8 GPUs; the single-GPU 15x8 only works for 1,3,5,15).')
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process

@@ -1,0 +1,8 @@
+# Install torch separately, matched to the host's CUDA -- pinning it here would fight
+# whatever the machine already has. See setup_gpu.sh.
+numpy
+datasets            # streaming FineWeb-Edu in data/finewebedu/prepare.py
+tiktoken            # GPT-2 BPE
+wandb
+tqdm
+requests
