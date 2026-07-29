@@ -59,11 +59,19 @@ SWEEPS = {
         dict(residual='baseline', n_layer=6, run_suffix='flat'),
         dict(residual='dense', n_layer=6, run_suffix='flat'),
     ),
+    # Dense at L12 is the only effect that replicated across LR schedules (-0.027 cosine,
+    # -0.025 flat). Everything so far is one seed, so re-run just that pair at 1338: if
+    # the gap survives a seed change it is real, and if it does not, nothing else here
+    # matters. Cheapest decisive test of the project's one positive result.
+    'seed1338': (
+        dict(residual='baseline', seed=1338, run_suffix='flat'),
+        dict(residual='dense', seed=1338, run_suffix='flat'),
+    ),
 }
 # per-sweep overrides layered between BASE and each run's own spec
-SWEEP_BASE = {k: dict(lr_schedule='constant') for k in ('flat_a', 'flat_b', 'shallow')}
+SWEEP_BASE = {k: dict(lr_schedule='constant') for k in ('flat_a', 'flat_b', 'shallow', 'seed1338')}
 # sweeps that share a W&B group, so runs split across kernels still compare in one place
-SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat', 'shallow': 'flat'}
+SWEEP_GROUP = {'flat_a': 'flat', 'flat_b': 'flat', 'shallow': 'flat', 'seed1338': 'flat-s1338'}
 ACTIVE = 'alive'  # push.py rewrites this line
 MAX_ITERS = os.environ.get('MAX_ITERS', '2000')
 SEED = os.environ.get('SEED', '1337')
